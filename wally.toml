@@ -1,0 +1,11 @@
+# Wally packages (https://wally.run). Nothing is needed for Milestone 1.
+# ProfileStore gets added here in Milestone 4, together with a "Packages"
+# entry in default.project.json. Run `wally install` after adding a dependency.
+
+[package]
+name = "fossil-expedition/simulator"
+version = "0.1.0"
+registry = "https://github.com/UpliftGames/wally-index"
+realm = "shared"
+
+[dependencies]

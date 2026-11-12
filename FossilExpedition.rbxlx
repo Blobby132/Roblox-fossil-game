@@ -1,0 +1,5743 @@
+<roblox version="4">
+  <Item class="ReplicatedStorage" referent="0">
+    <Properties>
+      <string name="Name">ReplicatedStorage</string>
+    </Properties>
+    <Item class="Folder" referent="1">
+      <Properties>
+        <string name="Name">Shared</string>
+      </Properties>
+      <Item class="Folder" referent="2">
+        <Properties>
+          <string name="Name">Config</string>
+        </Properties>
+        <Item class="ModuleScript" referent="3">
+          <Properties>
+            <string name="Name">DebugConfig</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	DebugConfig: developer-only shortcuts for playtesting.
+
+	The server decides who may use them (see DebugService): anyone while
+	playing inside Roblox Studio if AllowInStudio is true, plus the UserIds
+	listed here in a published game. Everyone else is ignored.
+]]
+
+local DebugConfig = {
+	Enabled = true,
+	AllowInStudio = true,
+
+	-- Roblox UserIds allowed to use debug shortcuts in the published game.
+	DeveloperUserIds = {} :: { number },
+
+	Keys = {
+		Reseed = Enum.KeyCode.R, -- refill and reseed your plot right now
+		ShowFossils = Enum.KeyCode.X, -- toggle markers over every buried fossil
+	},
+
+	MarkerColor = Color3.fromRGB(255, 60, 200),
+}
+
+return DebugConfig
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="4">
+          <Properties>
+            <string name="Name">DigConfig</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	DigConfig: input options and the limits the server enforces on digging.
+
+	The server re-checks every swing. These numbers decide how much slack it
+	gives honest players for network lag before it rejects a swing.
+]]
+
+local DigConfig = {
+	-- PC: holding the mouse button keeps swinging. Mobile is always one tap per swing.
+	HoldToRepeat = true,
+
+	-- How far the click / tap ray reaches, in studs.
+	MaxRayDistance = 300,
+
+	-- Extra reach (studs) the server allows on top of a tool's Range, because
+	-- the server sees the character slightly behind where the player sees it.
+	RangeTolerance = 3,
+
+	-- How early (seconds) a swing may arrive and still be accepted. Over time a
+	-- player can never swing faster than the tool's Cooldown; this only forgives
+	-- swings that bunch up on the network.
+	CooldownTolerance = 0.25,
+
+	-- Flood protection: requests per second the server will even look at.
+	MaxRequestsPerSecond = 12,
+	RequestBurst = 8,
+
+	-- The client forgets a swing the server never answered after this long.
+	PendingTimeout = 3,
+}
+
+return DigConfig
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="5">
+          <Properties>
+            <string name="Name">FeelConfig</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	FeelConfig: everything about how digging FEELS. Nothing in here changes
+	the rules of the game; it is all client-side feedback, so it is safe to
+	tune freely while playtesting.
+
+	Sounds are named here and defined in SoundConfig.
+]]
+
+export type MaterialFeel = {
+	HitSound: string,
+	BreakSound: string,
+	HitParticles: string,
+	BreakParticles: string,
+	HitShake: number, -- camera shake added per hit, 0-1
+	BreakShake: number, -- camera shake added when the cell breaks, 0-1
+	DebrisCount: number, -- crumble pieces thrown when the cell breaks
+}
+
+export type RarityFeel = {
+	Sound: string,
+	Intensity: number, -- scales sparkle count and light brightness
+	Shake: number, -- camera shake as the fossil pops out, 0-1
+	ExtraSlow: number, -- extra seconds of slow motion before the pop
+}
+
+export type ParticleDef = {
+	Texture: string,
+	Color: Color3,
+	Count: number,
+	Lifetime: NumberRange,
+	Speed: NumberRange,
+	SizeStart: number,
+	SizeEnd: number,
+	TransparencyStart: number,
+	TransparencyEnd: number,
+	SpreadAngle: number, -- degrees around the surface that was hit
+	Acceleration: Vector3,
+	Drag: number,
+	RotSpeed: NumberRange,
+	LightEmission: number,
+}
+
+-- Particle textures built into Roblox.
+local SMOKE = "rbxasset://textures/particles/smoke_main.dds"
+local SPARKLE = "rbxasset://textures/particles/sparkles_main.dds"
+
+local MATERIALS: { [string]: MaterialFeel } = {
+	Dirt = {
+		HitSound = "DirtHit",
+		BreakSound = "DirtBreak",
+		HitParticles = "DirtPuff",
+		BreakParticles = "DirtBurst",
+		HitShake = 0,
+		BreakShake = 0.1,
+		DebrisCount = 6,
+	},
+	Rock = {
+		HitSound = "RockHit",
+		BreakSound = "RockBreak",
+		HitParticles = "RockChips",
+		BreakParticles = "RockBurst",
+		HitShake = 0.25,
+		BreakShake = 0.45,
+		DebrisCount = 9,
+	},
+}
+
+local RARITY_FEEL: { [string]: RarityFeel } = {
+	Common = { Sound = "RevealCommon", Intensity = 1, Shake = 0.2, ExtraSlow = 0 },
+	Uncommon = { Sound = "RevealUncommon", Intensity = 1.35, Shake = 0.35, ExtraSlow = 0.1 },
+	Rare = { Sound = "RevealRare", Intensity = 1.9, Shake = 0.6, ExtraSlow = 0.3 },
+}
+
+local PARTICLES: { [string]: ParticleDef } = {
+	DirtPuff = {
+		Texture = SMOKE,
+		Color = Color3.fromRGB(150, 115, 80),
+		Count = 5,
+		Lifetime = NumberRange.new(0.25, 0.5),
+		Speed = NumberRange.new(4, 9),
+		SizeStart = 0.8,
+		SizeEnd = 1.8,
+		TransparencyStart = 0.4,
+		TransparencyEnd = 1,
+		SpreadAngle = 50,
+		Acceleration = Vector3.new(0, -10, 0),
+		Drag = 3,
+		RotSpeed = NumberRange.new(-120, 120),
+		LightEmission = 0,
+	},
+	DirtBurst = {
+		Texture = SMOKE,
+		Color = Color3.fromRGB(150, 115, 80),
+		Count = 14,
+		Lifetime = NumberRange.new(0.4, 0.8),
+		Speed = NumberRange.new(7, 15),
+		SizeStart = 1.2,
+		SizeEnd = 3,
+		TransparencyStart = 0.3,
+		TransparencyEnd = 1,
+		SpreadAngle = 80,
+		Acceleration = Vector3.new(0, -14, 0),
+		Drag = 3,
+		RotSpeed = NumberRange.new(-120, 120),
+		LightEmission = 0,
+	},
+	RockChips = {
+		Texture = SMOKE,
+		Color = Color3.fromRGB(172, 174, 180),
+		Count = 6,
+		Lifetime = NumberRange.new(0.2, 0.4),
+		Speed = NumberRange.new(8, 16),
+		SizeStart = 0.5,
+		SizeEnd = 1,
+		TransparencyStart = 0.2,
+		TransparencyEnd = 1,
+		SpreadAngle = 60,
+		Acceleration = Vector3.new(0, -30, 0),
+		Drag = 2,
+		RotSpeed = NumberRange.new(-200, 200),
+		LightEmission = 0,
+	},
+	RockBurst = {
+		Texture = SMOKE,
+		Color = Color3.fromRGB(172, 174, 180),
+		Count = 16,
+		Lifetime = NumberRange.new(0.4, 0.8),
+		Speed = NumberRange.new(9, 18),
+		SizeStart = 1,
+		SizeEnd = 2.6,
+		TransparencyStart = 0.25,
+		TransparencyEnd = 1,
+		SpreadAngle = 80,
+		Acceleration = Vector3.new(0, -24, 0),
+		Drag = 2.5,
+		RotSpeed = NumberRange.new(-200, 200),
+		LightEmission = 0,
+	},
+	CrustDust = {
+		Texture = SMOKE,
+		Color = Color3.fromRGB(190, 165, 125),
+		Count = 4,
+		Lifetime = NumberRange.new(0.3, 0.6),
+		Speed = NumberRange.new(2, 6),
+		SizeStart = 0.6,
+		SizeEnd = 1.6,
+		TransparencyStart = 0.5,
+		TransparencyEnd = 1,
+		SpreadAngle = 70,
+		Acceleration = Vector3.new(0, 2, 0),
+		Drag = 4,
+		RotSpeed = NumberRange.new(-90, 90),
+		LightEmission = 0,
+	},
+	FossilGlint = {
+		Texture = SPARKLE,
+		Color = Color3.fromRGB(255, 245, 200),
+		Count = 8,
+		Lifetime = NumberRange.new(0.4, 0.8),
+		Speed = NumberRange.new(3, 7),
+		SizeStart = 0.5,
+		SizeEnd = 0,
+		TransparencyStart = 0,
+		TransparencyEnd = 1,
+		SpreadAngle = 180,
+		Acceleration = Vector3.new(0, 0, 0),
+		Drag = 2,
+		RotSpeed = NumberRange.new(-180, 180),
+		LightEmission = 1,
+	},
+	-- Colour is replaced by the fossil's rarity colour.
+	RevealSparkle = {
+		Texture = SPARKLE,
+		Color = Color3.fromRGB(255, 255, 255),
+		Count = 26,
+		Lifetime = NumberRange.new(0.7, 1.4),
+		Speed = NumberRange.new(6, 14),
+		SizeStart = 0.9,
+		SizeEnd = 0,
+		TransparencyStart = 0,
+		TransparencyEnd = 1,
+		SpreadAngle = 180,
+		Acceleration = Vector3.new(0, -6, 0),
+		Drag = 2.5,
+		RotSpeed = NumberRange.new(-180, 180),
+		LightEmission = 1,
+	},
+	RefillDust = {
+		Texture = SMOKE,
+		Color = Color3.fromRGB(150, 115, 80),
+		Count = 30,
+		Lifetime = NumberRange.new(0.6, 1.2),
+		Speed = NumberRange.new(10, 24),
+		SizeStart = 3,
+		SizeEnd = 8,
+		TransparencyStart = 0.4,
+		TransparencyEnd = 1,
+		SpreadAngle = 85,
+		Acceleration = Vector3.new(0, -8, 0),
+		Drag = 2,
+		RotSpeed = NumberRange.new(-60, 60),
+		LightEmission = 0,
+	},
+}
+
+local FeelConfig = {
+	-- Rising pitch on consecutive hits.
+	Combo = {
+		Window = 1.2, -- a gap longer than this (seconds) resets the pitch
+		PitchStep = 0.04, -- pitch added per consecutive hit
+		MaxSteps = 10, -- pitch stops rising after this many hits
+		PitchJitter = 0.03, -- random +/- so repeated hits never sound identical
+	},
+
+	CameraShake = {
+		Enabled = true,
+		MaxOffset = 0.35, -- studs, at full strength
+		MaxRoll = 1, -- degrees, at full strength
+		Decay = 4.5, -- strength lost per second
+		Frequency = 26, -- how fast it rattles
+	},
+
+	Materials = MATERIALS,
+
+	-- How a cell reacts to each hit before it breaks.
+	CellHit = {
+		PunchSquash = 0.1, -- cell shrinks by this fraction for an instant
+		PunchDrop = 0.2, -- and is knocked down this many studs
+		PunchTime = 0.1, -- seconds to spring back
+		DamageShrink = 0.07, -- shrink (fraction) as a cell nears breaking
+		DamageDarken = 0.18, -- darkening (fraction) as a cell nears breaking
+		DamageTilt = 3, -- degrees of wobble as a cell nears breaking
+	},
+
+	-- The crumble when a cell breaks: small pieces thrown out, then shrinking away.
+	Crumble = {
+		Gravity = 60,
+		SpeedMin = 7,
+		SpeedMax = 16,
+		Upward = 12, -- extra upward speed, so pieces fly out of the hole
+		Lifetime = 0.75,
+		SizeMin = 0.4, -- piece size, studs
+		SizeMax = 1,
+		Spin = 9, -- radians per second
+		MaxPieces = 80, -- pooled; older pieces are reused past this
+	},
+
+	-- Hitting something with a tool that can't affect it.
+	WrongTool = {
+		Sound = "WrongTool",
+		Wiggle = 0.12, -- studs the cell shakes sideways
+		WiggleTime = 0.2,
+	},
+
+	-- Clicking or tapping something out of reach.
+	TooFar = {
+		Sound = "TooFar",
+		Color = Color3.fromRGB(255, 90, 90),
+		FlashTime = 0.25,
+		RetryDelay = 0.25, -- seconds before another "too far" cue can play
+	},
+
+	-- PC only: outline on the cell under the cursor.
+	Hover = {
+		Enabled = true,
+		LineThickness = 0.04,
+		ValidColor = Color3.fromRGB(255, 255, 255),
+		WrongToolColor = Color3.fromRGB(255, 170, 60),
+		TooFarColor = Color3.fromRGB(120, 120, 120),
+	},
+
+	-- The crusted fossil, from the moment its cell breaks until it is brushed clean.
+	Crust = {
+		FoundSound = "FossilFound",
+		FoundParticles = "FossilGlint",
+		BrushSound = "BrushStroke",
+		BrushParticles = "CrustDust",
+		Wobble = 0.1, -- studs the crust shakes on each brush stroke
+		WobbleTime = 0.14,
+		ShrinkWhenClean = 0.12, -- crust shrinks by this fraction as it is cleaned
+	},
+
+	-- The big moment when a fossil is fully uncovered.
+	Reveal = {
+		-- Brief slow motion. This is local to the player who found the fossil:
+		-- it slows their effects and pauses their digging, not the server.
+		StartSound = "RevealStart",
+		SlowTimeScale = 0.2, -- 0.2 = effects run at one fifth speed
+		SlowDuration = 0.4, -- seconds (real time)
+		RecoverDuration = 0.2, -- seconds to ease back to normal speed
+		SlowPitch = 0.6, -- sounds played during slow motion are pitched down to this
+
+		-- Camera zoom during the slow motion.
+		FovKick = -9, -- degrees; negative zooms in
+		FovAttack = 0.12,
+		FovRelease = 0.35,
+
+		-- Crust pieces that burst off as time slows.
+		CrustShards = 10,
+
+		-- The fossil popping out of the ground.
+		PopDuration = 0.55,
+		PopStartScale = 0.3,
+		PopOvershoot = 1.35,
+		HoverHeight = 2.5, -- studs above the plot's surface where it comes to rest
+		SpinTurns = 1,
+		InputLockAfterPop = 0.35, -- seconds before digging works again
+
+		-- After the pop it hovers and turns slowly.
+		IdleSpinSpeed = 30, -- degrees per second
+		IdleSparkleRate = 3, -- sparkles per second
+
+		-- Glow.
+		FillTransparencyStart = 0.1,
+		FillTransparencyEnd = 0.8,
+		GlowFadeTime = 1.2,
+		LightBrightnessStart = 8,
+		LightBrightnessEnd = 1.5,
+		LightRange = 12,
+
+		SparkleParticles = "RevealSparkle",
+
+		-- Name tag above the fossil (size in studs).
+		LabelWidth = 9,
+		LabelHeight = 2.4,
+		LabelOffset = 2.6,
+
+		-- Give up on the moment if the server has not confirmed it by then.
+		MaxWaitForServer = 1.5,
+
+		ByRarity = RARITY_FEEL,
+	},
+
+	Refill = {
+		Sound = "Refill",
+		Particles = "RefillDust",
+	},
+
+	Particles = PARTICLES,
+}
+
+return FeelConfig
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="6">
+          <Properties>
+            <string name="Name">FossilConfig</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	FossilConfig: every fossil that can be buried in a plot.
+
+	Weight controls how often a fossil is picked when a plot is seeded. With the
+	defaults, each fossil slot is 48% Ammonite, 28% Small Dinosaur Bone and 24%
+	a Triceratops piece (8% each). Raise the Triceratops weights while testing
+	if you want to see the Rare reveal more often.
+]]
+
+export type FossilDef = {
+	Id: string,
+	DisplayName: string,
+	Rarity: string, -- key in RarityConfig
+	Weight: number, -- relative chance of being buried
+	Set: string?, -- key in Sets, if this fossil is one piece of a set
+	CleanStrokes: number, -- brush strokes needed to uncover it once it is exposed
+	-- Greybox look once uncovered.
+	Shape: Enum.PartType,
+	Size: Vector3,
+	Rotation: Vector3, -- degrees
+	Color: Color3,
+}
+
+export type SetDef = {
+	DisplayName: string,
+	Pieces: { string }, -- fossil ids
+}
+
+local BONE = Color3.fromRGB(233, 224, 200)
+
+-- A Cylinder's long axis is X, so the ammonite is rotated to lie flat.
+local FOSSILS: { FossilDef } = {
+	{
+		Id = "Ammonite",
+		DisplayName = "Ammonite",
+		Rarity = "Common",
+		Weight = 48,
+		CleanStrokes = 4,
+		Shape = Enum.PartType.Cylinder,
+		Size = Vector3.new(0.7, 2.4, 2.4),
+		Rotation = Vector3.new(0, 0, 90),
+		Color = Color3.fromRGB(205, 180, 140),
+	},
+	{
+		Id = "SmallDinoBone",
+		DisplayName = "Small Dinosaur Bone",
+		Rarity = "Uncommon",
+		Weight = 28,
+		CleanStrokes = 5,
+		Shape = Enum.PartType.Cylinder,
+		Size = Vector3.new(2.8, 0.6, 0.6),
+		Rotation = Vector3.new(0, 30, 0),
+		Color = BONE,
+	},
+	{
+		Id = "TriceratopsHorn",
+		DisplayName = "Triceratops Horn",
+		Rarity = "Rare",
+		Weight = 8,
+		Set = "Triceratops",
+		CleanStrokes = 7,
+		Shape = Enum.PartType.Wedge,
+		Size = Vector3.new(0.8, 0.9, 3),
+		Rotation = Vector3.new(0, -25, 0),
+		Color = BONE,
+	},
+	{
+		Id = "TriceratopsSkull",
+		DisplayName = "Triceratops Skull Fragment",
+		Rarity = "Rare",
+		Weight = 8,
+		Set = "Triceratops",
+		CleanStrokes = 7,
+		Shape = Enum.PartType.Block,
+		Size = Vector3.new(2.6, 1.2, 2.2),
+		Rotation = Vector3.new(0, 20, 0),
+		Color = BONE,
+	},
+	{
+		Id = "TriceratopsClaw",
+		DisplayName = "Triceratops Claw",
+		Rarity = "Rare",
+		Weight = 8,
+		Set = "Triceratops",
+		CleanStrokes = 7,
+		Shape = Enum.PartType.CornerWedge,
+		Size = Vector3.new(0.9, 0.9, 1.8),
+		Rotation = Vector3.new(0, 40, 0),
+		Color = BONE,
+	},
+}
+
+local SETS: { [string]: SetDef } = {
+	Triceratops = {
+		DisplayName = "Triceratops",
+		Pieces = { "TriceratopsHorn", "TriceratopsSkull", "TriceratopsClaw" },
+	},
+}
+
+local byId: { [string]: FossilDef } = {}
+for _, def in FOSSILS do
+	byId[def.Id] = def
+end
+
+local FossilConfig = {
+	List = FOSSILS,
+	ById = byId,
+	Sets = SETS,
+
+	-- The dirt crust around a fossil after its cell is broken and before it has
+	-- been brushed clean. The crust is a plain block, so its size hints at what
+	-- is inside without giving it away.
+	Crust = {
+		SizeScale = 1.15, -- crust size compared with the fossil inside
+		Material = Enum.Material.Sand,
+		DirtyColor = Color3.fromRGB(92, 68, 46),
+		CleanColor = Color3.fromRGB(184, 158, 118),
+	},
+
+	-- Material of an uncovered fossil.
+	RevealedMaterial = Enum.Material.SmoothPlastic,
+}
+
+return FossilConfig
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="7">
+          <Properties>
+            <string name="Name">GridConfig</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	GridConfig: size and contents of each player's dig plot.
+
+	Changing Width / Length / Layers / CellSize resizes the pit automatically.
+	The greybox ground is built around whatever these say.
+]]
+
+export type LayerSetting = {
+	RockChance: number, -- chance (0-1) that a cell in this layer is rock, not dirt
+	Shade: number, -- brightness multiplier, so deeper layers look darker
+}
+
+export type HintLook = {
+	ColorBlend: number, -- how far (0-1) the cell colour shifts towards Hints.Color
+	Cracks: number, -- number of dark crack strips drawn on the cell's top face
+}
+
+-- One entry per layer, top to bottom. Add or remove entries when you change Layers.
+local LAYER_SETTINGS: { LayerSetting } = {
+	{ RockChance = 0, Shade = 1 },
+	{ RockChance = 0.25, Shade = 0.9 },
+	{ RockChance = 0.45, Shade = 0.8 },
+	{ RockChance = 0.65, Shade = 0.7 },
+}
+
+-- Index = hint level. Level 1 is the faintest, level 3 the strongest.
+local HINT_LEVELS: { HintLook } = {
+	{ ColorBlend = 0.14, Cracks = 0 },
+	{ ColorBlend = 0.28, Cracks = 1 },
+	{ ColorBlend = 0.45, Cracks = 3 },
+}
+
+local GridConfig = {
+	-- Grid dimensions, in cells.
+	Width = 8, -- cells along X
+	Length = 8, -- cells along Z
+	Layers = 4, -- cells deep; layer 1 is the surface
+
+	-- Size of one cell in studs (X, Y, Z).
+	-- Keep Layers * CellSize.Y below WorldConfig.Character.JumpHeight, so a
+	-- player standing at the very bottom of the pit can always jump back out.
+	CellSize = Vector3.new(4, 2, 4),
+
+	LayerSettings = LAYER_SETTINGS,
+
+	-- Every other cell is shaded by this amount so single cells read clearly.
+	CheckerShade = 0.95,
+
+	-- How many fossils are buried in a fresh plot.
+	FossilsMin = 4,
+	FossilsMax = 6,
+
+	-- Fossils never sit above this layer ("below the surface").
+	FossilMinLayer = 2,
+
+	-- If true, one fossil is always placed at FossilMinLayer so a new player
+	-- finds their first fossil quickly.
+	GuaranteeShallowFossil = true,
+
+	-- Seconds between the last fossil being uncovered and the plot refilling.
+	RefillDelay = 8,
+
+	-- Surface hints: cracked / discoloured cells above buried fossils.
+	Hints = {
+		-- Chance (0-1) that a fossil gives hints at all. Below 1, some fossils
+		-- are complete surprises.
+		Chance = 1,
+
+		-- Hint level for a cell N layers above a fossil: index 1 = directly
+		-- above, index 2 = two layers above, and so on. Cells further above
+		-- than this list is long show no hint.
+		LevelByDistance = { 3, 2, 1 },
+
+		-- Hint level of the cell that actually holds the fossil.
+		OwnCellLevel = 3,
+
+		Levels = HINT_LEVELS,
+
+		-- Hinted cells shift towards this pale, chalky colour.
+		Color = Color3.fromRGB(222, 205, 160),
+
+		CrackColor = Color3.fromRGB(46, 38, 30),
+		CrackThickness = 0.14, -- studs
+		CrackLengthMin = 0.3, -- fraction of the cell's width
+		CrackLengthMax = 0.7,
+	},
+}
+
+return GridConfig
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="8">
+          <Properties>
+            <string name="Name">MaterialConfig</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	MaterialConfig: what the dig grid is made of.
+
+	How each material sounds and feels when hit lives in FeelConfig.Materials.
+	How much damage each tool does to each material lives in ToolConfig.
+]]
+
+export type MaterialDef = {
+	DisplayName: string,
+	Health: number, -- total damage needed to break one cell
+	Color: Color3,
+	Material: Enum.Material,
+}
+
+local MATERIALS: { [string]: MaterialDef } = {
+	Dirt = {
+		DisplayName = "Dirt",
+		Health = 3,
+		Color = Color3.fromRGB(148, 108, 70),
+		Material = Enum.Material.Sand,
+	},
+	Rock = {
+		DisplayName = "Rock",
+		Health = 4,
+		Color = Color3.fromRGB(122, 124, 130),
+		Material = Enum.Material.Slate,
+	},
+}
+
+local MaterialConfig = {
+	Materials = MATERIALS,
+}
+
+return MaterialConfig
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="9">
+          <Properties>
+            <string name="Name">RarityConfig</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	RarityConfig: the rarity tiers fossils belong to.
+
+	How big the reveal moment is for each rarity lives in FeelConfig.Reveal.ByRarity.
+	Museum income multipliers get added here in Milestone 3.
+]]
+
+export type RarityDef = {
+	DisplayName: string,
+	Order: number, -- 1 = most common
+	Color: Color3, -- used for the glow, light and label when a fossil is uncovered
+}
+
+local RARITIES: { [string]: RarityDef } = {
+	Common = {
+		DisplayName = "Common",
+		Order = 1,
+		Color = Color3.fromRGB(235, 235, 225),
+	},
+	Uncommon = {
+		DisplayName = "Uncommon",
+		Order = 2,
+		Color = Color3.fromRGB(95, 215, 120),
+	},
+	Rare = {
+		DisplayName = "Rare",
+		Order = 3,
+		Color = Color3.fromRGB(80, 160, 255),
+	},
+}
+
+local RarityConfig = {
+	Rarities = RARITIES,
+}
+
+return RarityConfig
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="10">
+          <Properties>
+            <string name="Name">SoundConfig</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	SoundConfig: every sound effect, as one or more layers.
+
+	THESE ARE PLACEHOLDERS. They are built only from the handful of sounds
+	that ship inside Roblox itself (rbxasset://sounds/...), re-pitched to tell
+	materials apart, so they work with no uploads and no permissions.
+
+	To use a real sound, replace a layer's Id with "rbxassetid://<number>" from
+	the Creator Store (Audio tab) and set Pitch back to 1.
+
+	Layer fields:
+	  Id      sound asset
+	  Volume  0-1
+	  Pitch   playback speed; 1 = normal, 2 = an octave up
+	  Delay   seconds after the sound is triggered (lets layers form a little tune)
+	  Length  cut the layer off after this many seconds
+]]
+
+export type SoundLayer = {
+	Id: string,
+	Volume: number,
+	Pitch: number,
+	Delay: number?,
+	Length: number?,
+}
+
+-- The sounds built into Roblox.
+local THUD = "rbxasset://sounds/action_jump_land.mp3"
+local RUSTLE = "rbxasset://sounds/action_get_up.mp3"
+local WHUP = "rbxasset://sounds/action_jump.mp3"
+local BOOM = "rbxasset://sounds/impact_explosion_03.mp3"
+local TICK = "rbxasset://sounds/volume_slider.ogg"
+
+local SOUNDS: { [string]: { SoundLayer } } = {
+	-- Digging
+	DirtHit = {
+		{ Id = THUD, Volume = 0.45, Pitch = 1.35, Length = 0.3 },
+	},
+	DirtBreak = {
+		{ Id = THUD, Volume = 0.6, Pitch = 0.95 },
+		{ Id = BOOM, Volume = 0.12, Pitch = 2.6, Length = 0.35 },
+	},
+	RockHit = {
+		{ Id = THUD, Volume = 0.6, Pitch = 2.1, Length = 0.25 },
+		{ Id = TICK, Volume = 0.5, Pitch = 0.75 },
+	},
+	RockBreak = {
+		{ Id = BOOM, Volume = 0.3, Pitch = 1.9, Length = 0.5 },
+		{ Id = THUD, Volume = 0.7, Pitch = 0.75 },
+	},
+	BrushStroke = {
+		{ Id = RUSTLE, Volume = 0.3, Pitch = 1.7, Length = 0.22 },
+	},
+
+	-- "That didn't work" cues
+	WrongTool = {
+		{ Id = TICK, Volume = 0.55, Pitch = 0.45 },
+	},
+	TooFar = {
+		{ Id = TICK, Volume = 0.3, Pitch = 0.6 },
+	},
+	ToolSwitch = {
+		{ Id = TICK, Volume = 0.4, Pitch = 1.3 },
+	},
+
+	-- A crusted fossil appears where a cell just broke.
+	FossilFound = {
+		{ Id = THUD, Volume = 0.5, Pitch = 0.7 },
+		{ Id = TICK, Volume = 0.5, Pitch = 1.5, Delay = 0.08 },
+		{ Id = TICK, Volume = 0.5, Pitch = 2, Delay = 0.18 },
+	},
+
+	-- The big moment. RevealStart plays as time slows; the chime plays as the
+	-- fossil pops out. Rarer fossils get a longer rising chime.
+	RevealStart = {
+		{ Id = WHUP, Volume = 0.5, Pitch = 0.55 },
+	},
+	RevealCommon = {
+		{ Id = TICK, Volume = 0.6, Pitch = 1 },
+		{ Id = TICK, Volume = 0.6, Pitch = 1.26, Delay = 0.07 },
+		{ Id = TICK, Volume = 0.6, Pitch = 1.5, Delay = 0.14 },
+	},
+	RevealUncommon = {
+		{ Id = TICK, Volume = 0.65, Pitch = 1 },
+		{ Id = TICK, Volume = 0.65, Pitch = 1.26, Delay = 0.07 },
+		{ Id = TICK, Volume = 0.65, Pitch = 1.5, Delay = 0.14 },
+		{ Id = TICK, Volume = 0.65, Pitch = 2, Delay = 0.21 },
+	},
+	RevealRare = {
+		{ Id = BOOM, Volume = 0.25, Pitch = 0.8, Length = 0.8 },
+		{ Id = TICK, Volume = 0.7, Pitch = 1 },
+		{ Id = TICK, Volume = 0.7, Pitch = 1.19, Delay = 0.06 },
+		{ Id = TICK, Volume = 0.7, Pitch = 1.5, Delay = 0.12 },
+		{ Id = TICK, Volume = 0.7, Pitch = 1.78, Delay = 0.18 },
+		{ Id = TICK, Volume = 0.7, Pitch = 2, Delay = 0.24 },
+		{ Id = TICK, Volume = 0.7, Pitch = 2.52, Delay = 0.3 },
+	},
+
+	-- The plot refills with fresh ground.
+	Refill = {
+		{ Id = BOOM, Volume = 0.2, Pitch = 0.6, Length = 0.9 },
+		{ Id = RUSTLE, Volume = 0.4, Pitch = 0.8 },
+	},
+}
+
+local SoundConfig = {
+	-- Scales every sound effect at once.
+	MasterVolume = 1,
+
+	Sounds = SOUNDS,
+}
+
+return SoundConfig
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="11">
+          <Properties>
+            <string name="Name">ToolConfig</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	ToolConfig: the digging tools.
+
+	Time to break a cell = (material Health / Damage) * Cooldown.
+	With the defaults: pickaxe on rock 1.8 s, pickaxe on dirt 1.35 s,
+	brush on dirt 0.6 s, brush on rock never.
+]]
+
+export type ToolPart = {
+	Name: string,
+	Size: Vector3,
+	Offset: CFrame, -- position relative to the handle (the first part)
+	Color: Color3,
+}
+
+export type ToolDef = {
+	DisplayName: string,
+	Slot: number, -- hotbar position and number key
+	Cooldown: number, -- seconds between swings
+	Range: number, -- max studs from the character to the nearest point of the cell
+	Damage: { [string]: number }, -- damage per swing, by material id; 0 = can't break it
+	CleanPower: number, -- fossil cleaning strokes per swing; 0 = can't clean fossils
+	Grip: CFrame, -- where the hand holds the handle
+	Parts: { ToolPart }, -- greybox look; the first part is the handle
+}
+
+local WOOD = Color3.fromRGB(140, 98, 60)
+
+local TOOLS: { [string]: ToolDef } = {
+	Pickaxe = {
+		DisplayName = "Pickaxe",
+		Slot = 1,
+		Cooldown = 0.45,
+		Range = 11,
+		Damage = { Dirt = 1, Rock = 1 },
+		CleanPower = 0,
+		Grip = CFrame.new(0, -0.9, 0),
+		Parts = {
+			{
+				Name = "Handle",
+				Size = Vector3.new(0.35, 3.2, 0.35),
+				Offset = CFrame.new(),
+				Color = WOOD,
+			},
+			{
+				Name = "Head",
+				Size = Vector3.new(0.4, 0.4, 2.4),
+				Offset = CFrame.new(0, 1.4, 0),
+				Color = Color3.fromRGB(95, 100, 110),
+			},
+		},
+	},
+	Brush = {
+		DisplayName = "Brush",
+		Slot = 2,
+		Cooldown = 0.2,
+		Range = 11,
+		Damage = { Dirt = 1, Rock = 0 },
+		CleanPower = 1,
+		Grip = CFrame.new(0, -0.5, 0),
+		Parts = {
+			{
+				Name = "Handle",
+				Size = Vector3.new(0.35, 1.8, 0.35),
+				Offset = CFrame.new(),
+				Color = WOOD,
+			},
+			{
+				Name = "Bristles",
+				Size = Vector3.new(0.9, 0.7, 0.3),
+				Offset = CFrame.new(0, 1.2, 0),
+				Color = Color3.fromRGB(232, 214, 160),
+			},
+		},
+	},
+}
+
+local ToolConfig = {
+	-- The tool a player holds when they spawn.
+	DefaultTool = "Pickaxe",
+
+	Tools = TOOLS,
+}
+
+return ToolConfig
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="12">
+          <Properties>
+            <string name="Name">WorldConfig</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	WorldConfig: the greybox dig site that the server builds at startup.
+
+	Each player gets one plot: a ground tile with a pit in the middle, a spawn
+	pad in front of the pit and a museum pad behind it. Plots sit side by side
+	in a row.
+]]
+
+local WorldConfig = {
+	-- Plots built at startup. Keep this at or above the place's max players;
+	-- a player who joins when every plot is taken gets no plot.
+	MaxPlots = 8,
+
+	-- Height of the ground surface. It is raised so the pits clear the default
+	-- Baseplate if this is run in a place that still has one.
+	SurfaceY = 32,
+
+	-- Ground on each side of the pit, and in front of it where the player spawns.
+	PlotMargin = 14,
+
+	-- Solid floor under the pit.
+	BedrockThickness = 2,
+
+	-- Studs from the pit's front edge to the centre of the spawn pad.
+	SpawnDistance = 7,
+	SpawnPadSize = Vector3.new(6, 1, 6),
+
+	-- Placeholder for the Milestone 3 museum, so the walk from pit to museum
+	-- can already be judged.
+	Museum = {
+		Size = Vector3.new(24, 0.4, 18),
+		Gap = 6, -- studs between the pit's back edge and the museum pad
+		BackMargin = 6,
+		Color = Color3.fromRGB(196, 190, 176),
+		SignText = "MUSEUM\n(Milestone 3)",
+	},
+
+	-- Flat ground around the whole row of plots.
+	SurroundSize = 160,
+	SurroundThickness = 4,
+
+	Colors = {
+		Ground = Color3.fromRGB(108, 142, 92),
+		Surround = Color3.fromRGB(98, 130, 84),
+		Bedrock = Color3.fromRGB(58, 58, 64),
+		Cover = Color3.fromRGB(128, 112, 92), -- fills the pit of an unclaimed plot
+		SpawnPad = Color3.fromRGB(235, 200, 90),
+	},
+
+	Character = {
+		-- Higher than Roblox's default (7.2) so a player can always jump out of
+		-- a fully dug pit. See the note on GridConfig.CellSize.
+		JumpHeight = 9.5,
+	},
+
+	-- A bare place built by Rojo has dark default lighting, which hides the
+	-- inside of the pit. Set Apply to false to keep the place's own lighting.
+	Lighting = {
+		Apply = true,
+		Ambient = Color3.fromRGB(118, 118, 118),
+		OutdoorAmbient = Color3.fromRGB(150, 150, 150),
+		Brightness = 2,
+		ClockTime = 13.5,
+	},
+}
+
+return WorldConfig
+]]></string>
+          </Properties>
+        </Item>
+      </Item>
+      <Item class="Folder" referent="13">
+        <Properties>
+          <string name="Name">Dig</string>
+        </Properties>
+        <Item class="ModuleScript" referent="14">
+          <Properties>
+            <string name="Name">DigRules</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	DigRules: the digging rules that the server and the client both need.
+
+	The server uses these to decide what a swing does. The client uses the same
+	functions to predict the result, so feedback plays instantly and
+	almost always matches what the server decides a moment later.
+]]
+
+local Config = script.Parent.Parent.Config
+local GridConfig = require(Config.GridConfig)
+local GridMath = require(script.Parent.GridMath)
+local ToolConfig = require(Config.ToolConfig)
+
+local DigRules = {}
+
+-- The grid dimensions, in the shape GridMath expects.
+local dims: GridMath.Dims = {
+	Width = GridConfig.Width,
+	Length = GridConfig.Length,
+	Layers = GridConfig.Layers,
+}
+DigRules.Dims = dims
+
+-- Damage one swing of this tool does to this material. 0 means it can't break it.
+function DigRules.getDamage(toolId: string, materialId: string): number
+	local tool = ToolConfig.Tools[toolId]
+	if tool == nil then
+		return 0
+	end
+	return tool.Damage[materialId] or 0
+end
+
+-- Fossil cleaning strokes one swing of this tool does. 0 means it can't clean.
+function DigRules.getCleanPower(toolId: string): number
+	local tool = ToolConfig.Tools[toolId]
+	if tool == nil then
+		return 0
+	end
+	return tool.CleanPower
+end
+
+-- A cell can be dug when open air touches one of its faces: it is on the
+-- surface, or a cell next to it has already been dug out. The pit walls and
+-- floor do not count.
+function DigRules.isExposed(index: number, isSolid: (index: number) -> boolean): boolean
+	local _, layer = GridMath.fromIndex(dims, index)
+	if layer == 1 then
+		return true
+	end
+	for _, neighbor in GridMath.neighbors(dims, index) do
+		if not isSolid(neighbor) then
+			return true
+		end
+	end
+	return false
+end
+
+-- Centre of a cell in world space, given the centre of the pit's top surface.
+function DigRules.cellCenter(pitOrigin: Vector3, index: number): Vector3
+	local size = GridConfig.CellSize
+	local x, y, z = GridMath.cellOffset(dims, size.X, size.Y, size.Z, index)
+	return pitOrigin + Vector3.new(x, y, z)
+end
+
+-- Distance from a point to the nearest point of a cell. Both sides measure
+-- reach this way, from the character's root part.
+function DigRules.distanceToCell(point: Vector3, cellCenter: Vector3): number
+	local half = GridConfig.CellSize / 2
+	local delta = point - cellCenter
+	local dx = math.max(math.abs(delta.X) - half.X, 0)
+	local dy = math.max(math.abs(delta.Y) - half.Y, 0)
+	local dz = math.max(math.abs(delta.Z) - half.Z, 0)
+	return math.sqrt(dx * dx + dy * dy + dz * dz)
+end
+
+return DigRules
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="15">
+          <Properties>
+            <string name="Name">GridMath</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	GridMath: index and coordinate maths for the dig grid.
+
+	Pure functions only, no Roblox instances, so the server and the client
+	always agree on which cell is which.
+
+	A cell is addressed two ways:
+	  (x, layer, z)  x = 1..Width, layer = 1..Layers (1 is the surface), z = 1..Length
+	  index          a single number, 1..cellCount, which is what goes over the network
+]]
+
+export type Dims = {
+	Width: number,
+	Length: number,
+	Layers: number,
+}
+
+local GridMath = {}
+
+function GridMath.cellCount(dims: Dims): number
+	return dims.Width * dims.Length * dims.Layers
+end
+
+function GridMath.inBounds(dims: Dims, x: number, layer: number, z: number): boolean
+	return x >= 1
+		and x <= dims.Width
+		and layer >= 1
+		and layer <= dims.Layers
+		and z >= 1
+		and z <= dims.Length
+end
+
+function GridMath.toIndex(dims: Dims, x: number, layer: number, z: number): number
+	return (layer - 1) * dims.Width * dims.Length + (z - 1) * dims.Width + x
+end
+
+function GridMath.fromIndex(dims: Dims, index: number): (number, number, number)
+	local zeroBased = index - 1
+	local perLayer = dims.Width * dims.Length
+	local layer = zeroBased // perLayer + 1
+	local inLayer = zeroBased % perLayer
+	local z = inLayer // dims.Width + 1
+	local x = inLayer % dims.Width + 1
+	return x, layer, z
+end
+
+-- True only for whole numbers from 1 to cellCount. Rejects NaN, infinity and fractions.
+function GridMath.isValidIndex(dims: Dims, index: number): boolean
+	return index == index and index >= 1 and index <= GridMath.cellCount(dims) and index % 1 == 0
+end
+
+-- The up-to-six cells that share a face with this one.
+function GridMath.neighbors(dims: Dims, index: number): { number }
+	local x, layer, z = GridMath.fromIndex(dims, index)
+	local result: { number } = {}
+	local function add(nx: number, nLayer: number, nz: number)
+		if GridMath.inBounds(dims, nx, nLayer, nz) then
+			table.insert(result, GridMath.toIndex(dims, nx, nLayer, nz))
+		end
+	end
+	add(x, layer - 1, z)
+	add(x, layer + 1, z)
+	add(x - 1, layer, z)
+	add(x + 1, layer, z)
+	add(x, layer, z - 1)
+	add(x, layer, z + 1)
+	return result
+end
+
+-- Centre of a cell, as an offset from the centre of the pit's top surface.
+function GridMath.cellOffset(
+	dims: Dims,
+	sizeX: number,
+	sizeY: number,
+	sizeZ: number,
+	index: number
+): (number, number, number)
+	local x, layer, z = GridMath.fromIndex(dims, index)
+	local offsetX = (x - (dims.Width + 1) / 2) * sizeX
+	local offsetY = -(layer - 0.5) * sizeY
+	local offsetZ = (z - (dims.Length + 1) / 2) * sizeZ
+	return offsetX, offsetY, offsetZ
+end
+
+return GridMath
+]]></string>
+          </Properties>
+        </Item>
+      </Item>
+      <Item class="ModuleScript" referent="16">
+        <Properties>
+          <string name="Name">Remotes</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	Remotes: every RemoteEvent in the game, created in code.
+
+	The server calls Remotes.createAll() once at startup. After that, both
+	sides call Remotes.get("Name"). Nothing is made by hand in Studio.
+
+	Client -> server (the client only states intent; the server decides):
+	  SwingRequest(seq: number, cellIndex: number)
+	      "I swung at this cell of my plot."
+	  EquipRequest(toolId: string)
+	      "I want to hold this tool."
+	  DebugRequest(action: string)
+	      Developer shortcuts. Ignored unless DebugService allows the player.
+
+	Server -> client:
+	  SwingResult(seq: number, ok: boolean, code: string, value: number, defId: string?)
+	      The server's ruling on one SwingRequest.
+	      code:  Hit | Break | Clean | Reveal            (ok = true)
+	             WrongTool | TooFar | Cooldown | NotExposed | NothingThere |
+	             AlreadyRevealed | NoPlot | NoTool | NoCharacter   (ok = false)
+	      value: cell health left (Hit, Break) or cleaning strokes done (Clean, Reveal)
+	      defId: the fossil's id, only on Reveal
+	  DebugFossils(cellIndices: { number })
+	      Developer shortcut: where the buried fossils are.
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+export type RemoteName =
+	"SwingRequest"
+	| "SwingResult"
+	| "EquipRequest"
+	| "DebugRequest"
+	| "DebugFossils"
+
+local FOLDER_NAME = "Remotes"
+
+local NAMES: { RemoteName } = {
+	"SwingRequest",
+	"SwingResult",
+	"EquipRequest",
+	"DebugRequest",
+	"DebugFossils",
+}
+
+local Remotes = {}
+
+local cache: { [string]: RemoteEvent } = {}
+
+-- Server only. Creates the folder and every RemoteEvent.
+function Remotes.createAll()
+	assert(RunService:IsServer(), "Remotes.createAll must run on the server")
+	local folder = Instance.new("Folder")
+	folder.Name = FOLDER_NAME
+	for _, name in NAMES do
+		local remote = Instance.new("RemoteEvent")
+		remote.Name = name
+		remote.Parent = folder
+		cache[name] = remote
+	end
+	folder.Parent = ReplicatedStorage
+end
+
+function Remotes.get(name: RemoteName): RemoteEvent
+	local cached = cache[name]
+	if cached then
+		return cached
+	end
+	assert(not RunService:IsServer(), "Remotes.createAll has not been called yet")
+	local folder = ReplicatedStorage:WaitForChild(FOLDER_NAME)
+	local remote = folder:WaitForChild(name) :: RemoteEvent
+	cache[name] = remote
+	return remote
+end
+
+return Remotes
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="Folder" referent="17">
+        <Properties>
+          <string name="Name">Util</string>
+        </Properties>
+        <Item class="ModuleScript" referent="18">
+          <Properties>
+            <string name="Name">Signal</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	Signal: a minimal event object for script-to-script messages on one side
+	of the network (it does not cross between server and client).
+
+	    local changed = Signal.new()
+	    local connection = changed:Connect(function(value) print(value) end)
+	    changed:Fire(42)
+	    connection:Disconnect()
+]]
+
+local Signal = {}
+Signal.__index = Signal
+
+export type Callback = (...any) -> ()
+
+export type Connection = {
+	Disconnect: (self: Connection) -> (),
+}
+
+export type Signal = typeof(setmetatable({} :: { _callbacks: { Callback } }, Signal))
+
+function Signal.new(): Signal
+	return setmetatable({ _callbacks = {} }, Signal)
+end
+
+function Signal.Connect(self: Signal, callback: Callback): Connection
+	table.insert(self._callbacks, callback)
+	local callbacks = self._callbacks
+	local connection: Connection = {
+		Disconnect = function(_self: Connection)
+			local index = table.find(callbacks, callback)
+			if index then
+				table.remove(callbacks, index)
+			end
+		end,
+	}
+	return connection
+end
+
+function Signal.Fire(self: Signal, ...: any)
+	-- Copy first, so a callback that disconnects itself does not skip another.
+	for _, callback in table.clone(self._callbacks) do
+		task.spawn(callback, ...)
+	end
+end
+
+return Signal
+]]></string>
+          </Properties>
+        </Item>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="ServerScriptService" referent="19">
+    <Properties>
+      <string name="Name">ServerScriptService</string>
+    </Properties>
+    <Item class="Folder" referent="20">
+      <Properties>
+        <string name="Name">Server</string>
+      </Properties>
+      <Item class="Folder" referent="21">
+        <Properties>
+          <string name="Name">Dig</string>
+        </Properties>
+        <Item class="ModuleScript" referent="22">
+          <Properties>
+            <string name="Name">PlotGenerator</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	PlotGenerator: seeds a fresh plot. Decides each cell's material, where
+	the fossils are buried, and which cells show hints.
+
+	Pure logic: it takes a random-number function and returns plain data. Where
+	the fossils are stays on the server; clients only ever see what has been
+	exposed.
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Shared = ReplicatedStorage.Shared
+local DigRules = require(Shared.Dig.DigRules)
+local FossilConfig = require(Shared.Config.FossilConfig)
+local GridConfig = require(Shared.Config.GridConfig)
+local GridMath = require(Shared.Dig.GridMath)
+local MaterialConfig = require(Shared.Config.MaterialConfig)
+local PlotRules = require(script.Parent.PlotRules)
+
+local PlotGenerator = {}
+
+-- Whole number from min to max inclusive.
+local function randomInt(nextNumber: () -> number, min: number, max: number): number
+	if max <= min then
+		return min
+	end
+	return min + math.min(math.floor(nextNumber() * (max - min + 1)), max - min)
+end
+
+local function pickFossil(nextNumber: () -> number): FossilConfig.FossilDef
+	local total = 0
+	for _, def in FossilConfig.List do
+		total += def.Weight
+	end
+	local roll = nextNumber() * total
+	for _, def in FossilConfig.List do
+		roll -= def.Weight
+		if roll < 0 then
+			return def
+		end
+	end
+	return FossilConfig.List[#FossilConfig.List]
+end
+
+-- nextNumber must return a random number from 0 (inclusive) to 1 (exclusive).
+function PlotGenerator.generate(nextNumber: () -> number): PlotRules.PlotState
+	local dims = DigRules.Dims
+	local cells: { PlotRules.CellState } = {}
+	local fossils: { PlotRules.FossilState } = {}
+
+	-- 1. Materials.
+	for index = 1, GridMath.cellCount(dims) do
+		local _, layer = GridMath.fromIndex(dims, index)
+		local settings = GridConfig.LayerSettings[layer]
+		local rockChance = if settings then settings.RockChance else 0
+		local materialId = if nextNumber() < rockChance then "Rock" else "Dirt"
+		cells[index] = {
+			Material = materialId,
+			Health = MaterialConfig.Materials[materialId].Health,
+			Broken = false,
+			FossilIndex = nil,
+			HintLevel = 0,
+		}
+	end
+
+	-- 2. Fossils: at most one per column, so every hint points at one fossil.
+	local minLayer = math.clamp(GridConfig.FossilMinLayer, 1, dims.Layers)
+	local columns: { number } = {}
+	for column = 1, dims.Width * dims.Length do
+		columns[column] = column
+	end
+	local wanted = randomInt(nextNumber, GridConfig.FossilsMin, GridConfig.FossilsMax)
+	local count = math.clamp(wanted, 0, #columns)
+
+	for fossilIndex = 1, count do
+		-- Take a random column that is still free.
+		local slot = randomInt(nextNumber, 1, #columns)
+		local column = columns[slot]
+		columns[slot] = columns[#columns]
+		columns[#columns] = nil
+
+		local x = (column - 1) % dims.Width + 1
+		local z = (column - 1) // dims.Width + 1
+		local layer = randomInt(nextNumber, minLayer, dims.Layers)
+		if fossilIndex == 1 and GridConfig.GuaranteeShallowFossil then
+			layer = minLayer
+		end
+
+		local def = pickFossil(nextNumber)
+		local cellIndex = GridMath.toIndex(dims, x, layer, z)
+		cells[cellIndex].FossilIndex = fossilIndex
+		fossils[fossilIndex] = {
+			DefId = def.Id,
+			CellIndex = cellIndex,
+			Stage = "Buried",
+			Clean = 0,
+			CleanNeeded = def.CleanStrokes,
+		}
+
+		-- 3. Hints: the fossil's own cell and the cells above it, fading with distance.
+		if nextNumber() < GridConfig.Hints.Chance then
+			local hints = GridConfig.Hints
+			local maxLevel = #hints.Levels
+			cells[cellIndex].HintLevel = math.clamp(hints.OwnCellLevel, 0, maxLevel)
+			for above = layer - 1, 1, -1 do
+				local level = hints.LevelByDistance[layer - above] or 0
+				local aboveCell = cells[GridMath.toIndex(dims, x, above, z)]
+				aboveCell.HintLevel = math.max(aboveCell.HintLevel, math.clamp(level, 0, maxLevel))
+			end
+		end
+	end
+
+	return {
+		Cells = cells,
+		Fossils = fossils,
+		FossilsFound = 0,
+	}
+end
+
+return PlotGenerator
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="23">
+          <Properties>
+            <string name="Name">PlotRules</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	PlotRules: the authoritative state of one dig plot, and what a swing does to it.
+
+	This is plain data and pure logic: no parts, no players, no network. The
+	services turn the outcome into parts and messages. Keeping it pure means the
+	rules can be tested without Roblox running (see tests/).
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local DigRules = require(ReplicatedStorage.Shared.Dig.DigRules)
+
+export type FossilStage = "Buried" | "Encased" | "Revealed"
+
+export type CellState = {
+	Material: string,
+	Health: number,
+	Broken: boolean,
+	FossilIndex: number?, -- index into PlotState.Fossils, if a fossil sits in this cell
+	HintLevel: number, -- 0 = no hint; otherwise an index into GridConfig.Hints.Levels
+}
+
+export type FossilState = {
+	DefId: string,
+	CellIndex: number,
+	-- Buried:   still inside an unbroken cell.
+	-- Encased:  its cell is broken; it shows as a dirt crust to brush clean.
+	-- Revealed: fully uncovered.
+	Stage: FossilStage,
+	Clean: number, -- brush strokes done so far
+	CleanNeeded: number,
+}
+
+export type PlotState = {
+	Cells: { CellState },
+	Fossils: { FossilState },
+	FossilsFound: number,
+}
+
+export type SwingOutcome = {
+	Ok: boolean,
+	-- Ok:     Hit | Break | Clean | Reveal
+	-- Not ok: WrongTool | NotExposed | NothingThere | AlreadyRevealed
+	Code: string,
+	Value: number, -- cell health left (Hit, Break) or strokes done (Clean, Reveal)
+	FossilIndex: number?, -- the fossil involved, if any
+}
+
+local PlotRules = {}
+
+local function fail(code: string): SwingOutcome
+	return { Ok = false, Code = code, Value = 0 }
+end
+
+function PlotRules.isSolid(state: PlotState, index: number): boolean
+	local cell = state.Cells[index]
+	return cell ~= nil and not cell.Broken
+end
+
+function PlotRules.isExposed(state: PlotState, index: number): boolean
+	return DigRules.isExposed(index, function(neighbor: number): boolean
+		return PlotRules.isSolid(state, neighbor)
+	end)
+end
+
+function PlotRules.isComplete(state: PlotState): boolean
+	return state.FossilsFound >= #state.Fossils
+end
+
+-- Applies one swing to the plot and reports what happened.
+-- The caller has already checked who is swinging, from where and how often.
+function PlotRules.resolveSwing(state: PlotState, index: number, toolId: string): SwingOutcome
+	local cell = state.Cells[index]
+	if cell == nil then
+		return fail("NothingThere")
+	end
+
+	-- An unbroken cell: dig it.
+	if not cell.Broken then
+		if not PlotRules.isExposed(state, index) then
+			return fail("NotExposed")
+		end
+		local damage = DigRules.getDamage(toolId, cell.Material)
+		if damage <= 0 then
+			return fail("WrongTool")
+		end
+		cell.Health = math.max(0, cell.Health - damage)
+		if cell.Health > 0 then
+			return { Ok = true, Code = "Hit", Value = cell.Health }
+		end
+		cell.Broken = true
+		local fossilIndex = cell.FossilIndex
+		if fossilIndex then
+			state.Fossils[fossilIndex].Stage = "Encased"
+		end
+		return { Ok = true, Code = "Break", Value = 0, FossilIndex = fossilIndex }
+	end
+
+	-- A broken cell: the only thing left to hit is a fossil's crust.
+	local fossilIndex = cell.FossilIndex
+	if fossilIndex == nil then
+		return fail("NothingThere")
+	end
+	local fossil = state.Fossils[fossilIndex]
+	if fossil.Stage == "Revealed" then
+		return fail("AlreadyRevealed")
+	end
+	local power = DigRules.getCleanPower(toolId)
+	if power <= 0 then
+		return fail("WrongTool")
+	end
+	fossil.Clean = math.min(fossil.CleanNeeded, fossil.Clean + power)
+	if fossil.Clean < fossil.CleanNeeded then
+		return { Ok = true, Code = "Clean", Value = fossil.Clean, FossilIndex = fossilIndex }
+	end
+	fossil.Stage = "Revealed"
+	state.FossilsFound += 1
+	return { Ok = true, Code = "Reveal", Value = fossil.Clean, FossilIndex = fossilIndex }
+end
+
+return PlotRules
+]]></string>
+          </Properties>
+        </Item>
+      </Item>
+      <Item class="Script" referent="24">
+        <Properties>
+          <string name="Name">Main</string>
+          <token name="RunContext">0</token>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	Server entry point. This is the only Script on the server; everything else
+	is a ModuleScript that this file loads.
+
+	Each service may have:
+	  Init()   set itself up; must not rely on other services being ready
+	  Start()  connect events and begin work; every service has been Init'd
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Remotes = require(ReplicatedStorage.Shared.Remotes)
+
+-- Create every RemoteEvent before any service asks for one.
+Remotes.createAll()
+
+local Services = script.Parent.Services
+local DebugService = require(Services.DebugService)
+local DigService = require(Services.DigService)
+local FossilService = require(Services.FossilService)
+local PlotService = require(Services.PlotService)
+local ToolService = require(Services.ToolService)
+
+-- Later milestones add MuseumService, EconomyService and DataService here.
+local services: { any } = {
+	PlotService,
+	FossilService,
+	ToolService,
+	DigService,
+	DebugService,
+}
+
+for _, service in services do
+	if service.Init then
+		service.Init()
+	end
+end
+
+for _, service in services do
+	if service.Start then
+		service.Start()
+	end
+end
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="Folder" referent="25">
+        <Properties>
+          <string name="Name">Services</string>
+        </Properties>
+        <Item class="ModuleScript" referent="26">
+          <Properties>
+            <string name="Name">DebugService</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	DebugService: developer-only shortcuts for playtesting.
+
+	The client can ask, but the server decides who is allowed: anyone while
+	playing inside Roblox Studio (if DebugConfig.AllowInStudio), plus the
+	UserIds in DebugConfig.DeveloperUserIds. Requests from anyone else are
+	ignored, so these are safe to leave in a published game.
+
+	Actions:
+	  Reseed       refill and reseed the player's own plot right now
+	  ShowFossils  send the player the cells that still hide a fossil
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local Shared = ReplicatedStorage.Shared
+local DebugConfig = require(Shared.Config.DebugConfig)
+local Remotes = require(Shared.Remotes)
+
+local FossilService = require(script.Parent.FossilService)
+local PlotService = require(script.Parent.PlotService)
+local RateLimiter = require(script.Parent.Parent.Util.RateLimiter)
+
+local DebugService = {}
+
+local limiter = RateLimiter.new(2, 4)
+
+function DebugService.IsAllowed(player: Player): boolean
+	if not DebugConfig.Enabled then
+		return false
+	end
+	if DebugConfig.AllowInStudio and RunService:IsStudio() then
+		return true
+	end
+	return table.find(DebugConfig.DeveloperUserIds, player.UserId) ~= nil
+end
+
+-- Client -> server. Every argument is untrusted.
+local function onDebugRequest(player: Player, action: any)
+	if typeof(action) ~= "string" then
+		return
+	end
+	if not DebugService.IsAllowed(player) or not limiter:allow(player) then
+		return
+	end
+	local plot = PlotService.GetPlot(player)
+	if plot == nil then
+		return
+	end
+
+	if action == "Reseed" then
+		PlotService.Regenerate(plot)
+	elseif action == "ShowFossils" then
+		Remotes.get("DebugFossils"):FireClient(player, FossilService.GetHiddenCells(plot))
+	end
+end
+
+function DebugService.Start()
+	Remotes.get("DebugRequest").OnServerEvent:Connect(onDebugRequest)
+end
+
+return DebugService
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="27">
+          <Properties>
+            <string name="Name">DigService</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	DigService: rules on every swing.
+
+	The client only ever says "I swung at cell N of my plot". It never says
+	which tool, how much damage, or what was found. For each request the server
+	checks, in order:
+
+	  1. the request is well formed (right types, a real cell number)
+	  2. the player is not flooding the remote
+	  3. the player has a plot, a living character and a tool in hand
+	  4. the tool's cooldown has passed
+	  5. the character is close enough to the cell
+	  6. the cell can be hit: it exists, is exposed, and the tool affects it
+
+	Only then does it change the plot, and it always answers with SwingResult
+	so the client can correct its prediction.
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Shared = ReplicatedStorage.Shared
+local DigConfig = require(Shared.Config.DigConfig)
+local DigRules = require(Shared.Dig.DigRules)
+local GridMath = require(Shared.Dig.GridMath)
+local Remotes = require(Shared.Remotes)
+local ToolConfig = require(Shared.Config.ToolConfig)
+
+local Server = script.Parent.Parent
+local FossilService = require(script.Parent.FossilService)
+local PlotRules = require(Server.Dig.PlotRules)
+local PlotService = require(script.Parent.PlotService)
+local RateLimiter = require(Server.Util.RateLimiter)
+local ToolService = require(script.Parent.ToolService)
+
+local DigService = {}
+
+local limiter = RateLimiter.new(DigConfig.MaxRequestsPerSecond, DigConfig.RequestBurst)
+
+-- The earliest time each player's next swing is due.
+local nextSwingAt: { [Player]: number } = {}
+
+-- Decides one swing. Returns ok, code, value, defId (see Remotes).
+local function resolve(player: Player, cellIndex: number): (boolean, string, number, string?)
+	local plot = PlotService.GetPlot(player)
+	local state = plot and plot.State
+	if plot == nil or state == nil then
+		return false, "NoPlot", 0, nil
+	end
+
+	local toolId = ToolService.GetEquipped(player)
+	local tool = toolId and ToolConfig.Tools[toolId]
+	if toolId == nil or tool == nil then
+		return false, "NoTool", 0, nil
+	end
+
+	local character = player.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if humanoid == nil or humanoid.Health <= 0 or root == nil or not root:IsA("BasePart") then
+		return false, "NoCharacter", 0, nil
+	end
+
+	-- Cooldown. A swing may arrive a little early (network jitter), but each
+	-- accepted swing pushes the next one a full cooldown later, so over time
+	-- nobody swings faster than the tool allows.
+	local now = os.clock()
+	local dueAt = nextSwingAt[player] or 0
+	if now < dueAt - DigConfig.CooldownTolerance then
+		return false, "Cooldown", 0, nil
+	end
+
+	-- Reach, measured by the server from where it sees the character.
+	local cellCenter = PlotService.GetCellCenter(plot, cellIndex)
+	local distance = DigRules.distanceToCell(root.Position, cellCenter)
+	if distance > tool.Range + DigConfig.RangeTolerance then
+		return false, "TooFar", 0, nil
+	end
+
+	local outcome = PlotRules.resolveSwing(state, cellIndex, toolId)
+	if outcome.Ok or outcome.Code == "WrongTool" then
+		-- A swing was spent, whether or not it did anything.
+		nextSwingAt[player] = math.max(now, dueAt) + tool.Cooldown
+	end
+
+	local defId: string? = nil
+	if outcome.Code == "Hit" then
+		PlotService.SetCellHealth(plot, cellIndex, outcome.Value)
+	elseif outcome.Code == "Break" then
+		PlotService.RemoveCell(plot, cellIndex)
+		if outcome.FossilIndex then
+			FossilService.Expose(plot, outcome.FossilIndex)
+		end
+	elseif outcome.Code == "Clean" and outcome.FossilIndex then
+		FossilService.SetClean(plot, outcome.FossilIndex, outcome.Value)
+	elseif outcome.Code == "Reveal" and outcome.FossilIndex then
+		defId = FossilService.Reveal(plot, outcome.FossilIndex)
+	end
+
+	return outcome.Ok, outcome.Code, outcome.Value, defId
+end
+
+-- Client -> server. Every argument is untrusted.
+local function onSwingRequest(player: Player, seq: any, cellIndex: any)
+	if typeof(seq) ~= "number" or typeof(cellIndex) ~= "number" then
+		return
+	end
+	if seq ~= seq or seq % 1 ~= 0 then
+		return
+	end
+	if not GridMath.isValidIndex(DigRules.Dims, cellIndex) then
+		return
+	end
+	if not limiter:allow(player) then
+		return
+	end
+
+	local ok, code, value, defId = resolve(player, cellIndex)
+	Remotes.get("SwingResult"):FireClient(player, seq, ok, code, value, defId)
+end
+
+function DigService.Start()
+	Remotes.get("SwingRequest").OnServerEvent:Connect(onSwingRequest)
+	Players.PlayerRemoving:Connect(function(player: Player)
+		nextSwingAt[player] = nil
+		limiter:forget(player)
+	end)
+end
+
+return DigService
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="28">
+          <Properties>
+            <string name="Name">FossilService</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	FossilService: the fossil parts inside a plot.
+
+	A fossil goes through three stages (see PlotRules.FossilState):
+	  Buried    no part exists, so nothing about it reaches any client
+	  Encased   its cell was broken; it appears as a plain dirt crust
+	  Revealed  brushed clean; the crust becomes the fossil's real shape
+
+	Which fossil it is (DefId) is only written onto the part at Revealed.
+
+	Milestone 2 picks up from here: a Revealed fossil is what the extraction
+	minigame will start from.
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Shared = ReplicatedStorage.Shared
+local DigRules = require(Shared.Dig.DigRules)
+local FossilConfig = require(Shared.Config.FossilConfig)
+local GridConfig = require(Shared.Config.GridConfig)
+
+local Server = script.Parent.Parent
+local PlotRules = require(Server.Dig.PlotRules)
+local PlotService = require(script.Parent.PlotService)
+
+local FossilService = {}
+
+local function rotationOf(def: FossilConfig.FossilDef): CFrame
+	return CFrame.Angles(
+		math.rad(def.Rotation.X),
+		math.rad(def.Rotation.Y),
+		math.rad(def.Rotation.Z)
+	)
+end
+
+-- Size of the upright box that fits around a rotated part.
+local function boundsOf(size: Vector3, rotation: CFrame): Vector3
+	local right, up, back = rotation.XVector, rotation.YVector, rotation.ZVector
+	return Vector3.new(
+		math.abs(right.X) * size.X + math.abs(up.X) * size.Y + math.abs(back.X) * size.Z,
+		math.abs(right.Y) * size.X + math.abs(up.Y) * size.Y + math.abs(back.Y) * size.Z,
+		math.abs(right.Z) * size.X + math.abs(up.Z) * size.Y + math.abs(back.Z) * size.Z
+	)
+end
+
+-- Where something of this height rests on the floor of a cell.
+local function restPosition(plot: PlotService.Plot, cellIndex: number, height: number): Vector3
+	local center = DigRules.cellCenter(plot.Origin, cellIndex)
+	return center + Vector3.new(0, -GridConfig.CellSize.Y / 2 + height / 2 + 0.05, 0)
+end
+
+-- The fossil's cell just broke: show it as a crust for the player to brush.
+function FossilService.Expose(plot: PlotService.Plot, fossilIndex: number)
+	local state = plot.State
+	if state == nil or plot.FossilParts[fossilIndex] then
+		return
+	end
+	local fossil = state.Fossils[fossilIndex]
+	local def = FossilConfig.ById[fossil.DefId]
+	local crust = FossilConfig.Crust
+	local size = boundsOf(def.Size, rotationOf(def)) * crust.SizeScale
+
+	local part = Instance.new("Part")
+	part.Name = tostring(fossil.CellIndex)
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanTouch = false
+	part.Size = size
+	part.Position = restPosition(plot, fossil.CellIndex, size.Y)
+	part.Material = crust.Material
+	part.Color = crust.DirtyColor
+	part.TopSurface = Enum.SurfaceType.Smooth
+	part.BottomSurface = Enum.SurfaceType.Smooth
+	part:SetAttribute("Stage", "Encased")
+	part:SetAttribute("Clean", 0)
+	part:SetAttribute("CleanNeeded", fossil.CleanNeeded)
+	part.Parent = plot.FossilsFolder
+	plot.FossilParts[fossilIndex] = part
+end
+
+-- A brush stroke landed but the fossil is not clean yet.
+function FossilService.SetClean(plot: PlotService.Plot, fossilIndex: number, clean: number)
+	local part = plot.FossilParts[fossilIndex]
+	if part then
+		part:SetAttribute("Clean", clean)
+	end
+end
+
+-- The last stroke landed: turn the crust into the fossil. Returns the fossil's id.
+function FossilService.Reveal(plot: PlotService.Plot, fossilIndex: number): string?
+	local state = plot.State
+	local part = plot.FossilParts[fossilIndex]
+	if state == nil or part == nil then
+		return nil
+	end
+	local fossil = state.Fossils[fossilIndex]
+	local def = FossilConfig.ById[fossil.DefId]
+	local rotation = rotationOf(def)
+	local height = boundsOf(def.Size, rotation).Y
+
+	part.Shape = def.Shape
+	part.Size = def.Size
+	part.CFrame = CFrame.new(restPosition(plot, fossil.CellIndex, height)) * rotation
+	part.Material = FossilConfig.RevealedMaterial
+	part.Color = def.Color
+	part:SetAttribute("Clean", fossil.Clean)
+	part:SetAttribute("DefId", def.Id)
+	part:SetAttribute("Stage", "Revealed")
+
+	plot.Model:SetAttribute("FossilsFound", state.FossilsFound)
+	if PlotRules.isComplete(state) then
+		PlotService.ScheduleRefill(plot)
+	end
+	return def.Id
+end
+
+-- Cell indices of the fossils that are still not uncovered (debug only).
+function FossilService.GetHiddenCells(plot: PlotService.Plot): { number }
+	local result: { number } = {}
+	local state = plot.State
+	if state then
+		for _, fossil in state.Fossils do
+			if fossil.Stage ~= "Revealed" then
+				table.insert(result, fossil.CellIndex)
+			end
+		end
+	end
+	return result
+end
+
+return FossilService
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="29">
+          <Properties>
+            <string name="Name">PlotService</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	PlotService: gives each player their own dig plot and owns the grid parts.
+
+	  * Builds the greybox site once (WorldBuilder).
+	  * Assigns a free plot when a player joins and frees it when they leave.
+	  * Turns a plot's state (PlotRules.PlotState) into cell parts, and keeps
+	    the parts in step as cells are damaged and broken.
+	  * Refills and reseeds a plot once every fossil has been uncovered.
+
+	Per-player plots are a prototype decision. To change it later, this is the
+	only service that knows which plot belongs to whom: everything else asks
+	PlotService.GetPlot(player).
+
+	What clients can see is deliberately limited: a buried fossil has no part,
+	and a cell only gets its hint look (tint and cracks) once it is exposed, so
+	an exploiter cannot read fossil positions out of the workspace.
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+
+local Shared = ReplicatedStorage.Shared
+local DigRules = require(Shared.Dig.DigRules)
+local GridConfig = require(Shared.Config.GridConfig)
+local GridMath = require(Shared.Dig.GridMath)
+local MaterialConfig = require(Shared.Config.MaterialConfig)
+local WorldConfig = require(Shared.Config.WorldConfig)
+
+local Server = script.Parent.Parent
+local PlotGenerator = require(Server.Dig.PlotGenerator)
+local PlotRules = require(Server.Dig.PlotRules)
+local WorldBuilder = require(Server.World.WorldBuilder)
+
+export type Plot = {
+	Id: number,
+	Model: Model,
+	Origin: Vector3, -- centre of the pit's top surface
+	CellsFolder: Folder,
+	FossilsFolder: Folder,
+	Cover: Part,
+	Spawn: SpawnLocation,
+	Owner: Player?,
+	State: PlotRules.PlotState?,
+	CellParts: { [number]: Part }, -- by cell index
+	FossilParts: { [number]: Part }, -- by fossil index
+	Dressed: { [number]: boolean }, -- cells that already show their hint
+	Generation: number, -- goes up by one every time the plot is reseeded
+	RefillToken: number, -- cancels a scheduled refill when it changes
+}
+
+local PlotService = {}
+
+local plots: { Plot } = {}
+local plotByPlayer: { [Player]: Plot } = {}
+local random = Random.new()
+
+local function shade(color: Color3, amount: number): Color3
+	return Color3.new(
+		math.clamp(color.R * amount, 0, 1),
+		math.clamp(color.G * amount, 0, 1),
+		math.clamp(color.B * amount, 0, 1)
+	)
+end
+
+local function buildCell(plot: Plot, index: number, cell: PlotRules.CellState)
+	local material = MaterialConfig.Materials[cell.Material]
+	local x, layer, z = GridMath.fromIndex(DigRules.Dims, index)
+	local layerSettings = GridConfig.LayerSettings[layer]
+	local amount = if layerSettings then layerSettings.Shade else 1
+	if (x + layer + z) % 2 == 0 then
+		amount *= GridConfig.CheckerShade
+	end
+
+	local part = Instance.new("Part")
+	part.Name = tostring(index)
+	part.Anchored = true
+	part.Size = GridConfig.CellSize
+	part.Position = DigRules.cellCenter(plot.Origin, index)
+	part.Material = material.Material
+	part.Color = shade(material.Color, amount)
+	part.TopSurface = Enum.SurfaceType.Smooth
+	part.BottomSurface = Enum.SurfaceType.Smooth
+	part:SetAttribute("Mat", cell.Material)
+	part:SetAttribute("Health", cell.Health)
+	part.Parent = plot.CellsFolder
+	plot.CellParts[index] = part
+end
+
+-- Shows a cell's hint (tint and cracks). Called only once the cell is exposed.
+local function dressCell(plot: Plot, index: number)
+	local state = plot.State
+	local part = plot.CellParts[index]
+	if state == nil or part == nil or plot.Dressed[index] then
+		return
+	end
+	local look = GridConfig.Hints.Levels[state.Cells[index].HintLevel]
+	if look == nil then
+		return
+	end
+	plot.Dressed[index] = true
+
+	local hints = GridConfig.Hints
+	part.Color = part.Color:Lerp(hints.Color, look.ColorBlend)
+
+	local size = GridConfig.CellSize
+	local span = math.min(size.X, size.Z)
+	for _ = 1, look.Cracks do
+		local length = span * random:NextNumber(hints.CrackLengthMin, hints.CrackLengthMax)
+		-- Keep the whole strip on the cell's top face, whatever its angle.
+		local reachX = math.max(size.X / 2 - length / 2, 0)
+		local reachZ = math.max(size.Z / 2 - length / 2, 0)
+		local offset = Vector3.new(
+			random:NextNumber(-reachX, reachX),
+			size.Y / 2 + 0.02,
+			random:NextNumber(-reachZ, reachZ)
+		)
+		local crack = Instance.new("Part")
+		crack.Name = "Crack"
+		crack.Anchored = true
+		crack.CanCollide = false
+		crack.CanQuery = false
+		crack.CanTouch = false
+		crack.CastShadow = false
+		crack.Size = Vector3.new(length, 0.06, hints.CrackThickness)
+		crack.CFrame = CFrame.new(part.Position + offset)
+			* CFrame.Angles(0, random:NextNumber(0, math.pi), 0)
+		crack.Color = hints.CrackColor
+		crack.Material = Enum.Material.SmoothPlastic
+		crack.Parent = part
+	end
+end
+
+-- Moves anyone standing in the pit up to the surface, so new cells never
+-- appear around them.
+local function liftCharactersOutOfPit(plot: Plot)
+	local size = GridConfig.CellSize
+	local halfX = GridConfig.Width * size.X / 2
+	local halfZ = GridConfig.Length * size.Z / 2
+	for _, player in Players:GetPlayers() do
+		local character = player.Character
+		local root = character and character:FindFirstChild("HumanoidRootPart")
+		if character and root and root:IsA("BasePart") then
+			local offset = root.Position - plot.Origin
+			local inPit = math.abs(offset.X) <= halfX + 1 and math.abs(offset.Z) <= halfZ + 1
+			if inPit and offset.Y < 3.5 then
+				character:PivotTo(
+					root.CFrame.Rotation
+						+ Vector3.new(root.Position.X, plot.Origin.Y + 4, root.Position.Z)
+				)
+			end
+		end
+	end
+end
+
+local function clearGrid(plot: Plot)
+	plot.RefillToken += 1
+	plot.State = nil
+	plot.CellsFolder:ClearAllChildren()
+	plot.FossilsFolder:ClearAllChildren()
+	table.clear(plot.CellParts)
+	table.clear(plot.FossilParts)
+	table.clear(plot.Dressed)
+	plot.Model:SetAttribute("RefillAt", 0)
+end
+
+local function generate(plot: Plot)
+	clearGrid(plot)
+	liftCharactersOutOfPit(plot)
+
+	local state = PlotGenerator.generate(function(): number
+		return random:NextNumber()
+	end)
+	plot.State = state
+	plot.Generation += 1
+
+	for index, cell in state.Cells do
+		buildCell(plot, index, cell)
+	end
+	-- Only the surface is exposed at the start.
+	for index in state.Cells do
+		if PlotRules.isExposed(state, index) then
+			dressCell(plot, index)
+		end
+	end
+
+	plot.Model:SetAttribute("FossilsTotal", #state.Fossils)
+	plot.Model:SetAttribute("FossilsFound", 0)
+	plot.Model:SetAttribute("Generation", plot.Generation)
+end
+
+local function spawnCFrame(plot: Plot): CFrame
+	return plot.Spawn.CFrame + Vector3.new(0, 4, 0)
+end
+
+local function onCharacterAdded(player: Player, character: Model)
+	local plot = plotByPlayer[player]
+	local humanoid = character:WaitForChild("Humanoid", 10)
+	local root = character:WaitForChild("HumanoidRootPart", 10)
+	if
+		humanoid == nil
+		or root == nil
+		or not humanoid:IsA("Humanoid")
+		or not root:IsA("BasePart")
+	then
+		return
+	end
+	humanoid.UseJumpPower = false
+	humanoid.JumpHeight = WorldConfig.Character.JumpHeight
+
+	-- RespawnLocation normally puts the character on its own pad. This is the
+	-- safety net for a character that loaded before the plot was assigned.
+	if plot and plot.Owner == player then
+		local padDistance = (root.Position - plot.Spawn.Position).Magnitude
+		if padDistance > 30 then
+			character:PivotTo(spawnCFrame(plot))
+		end
+	end
+end
+
+local function assign(player: Player)
+	if plotByPlayer[player] then
+		return
+	end
+	local free: Plot? = nil
+	for _, plot in plots do
+		if plot.Owner == nil then
+			free = plot
+			break
+		end
+	end
+	if free == nil then
+		warn(`[PlotService] No free plot for {player.Name}. Raise WorldConfig.MaxPlots.`)
+		return
+	end
+
+	free.Owner = player
+	plotByPlayer[player] = free
+	free.Cover.Parent = nil
+	-- With instance streaming on, keep the owner's own plot loaded at all
+	-- times. This is only an optimisation, so a failure must not stop the
+	-- player getting their plot.
+	local model = free.Model
+	pcall(function()
+		model:AddPersistentPlayer(player)
+	end)
+	model:SetAttribute("OwnerUserId", player.UserId)
+	generate(free)
+
+	-- Taps and clicks dig, so they must never also walk the character.
+	player.DevTouchMovementMode = Enum.DevTouchMovementMode.DynamicThumbstick
+	player.DevComputerMovementMode = Enum.DevComputerMovementMode.KeyboardMouse
+
+	player.RespawnLocation = free.Spawn
+	player:SetAttribute("PlotName", free.Model.Name)
+
+	player.CharacterAdded:Connect(function(character: Model)
+		onCharacterAdded(player, character)
+	end)
+	local character = player.Character
+	if character then
+		task.spawn(onCharacterAdded, player, character)
+	end
+end
+
+local function release(player: Player)
+	local plot = plotByPlayer[player]
+	if plot == nil then
+		return
+	end
+	plotByPlayer[player] = nil
+	plot.Owner = nil
+	clearGrid(plot)
+	plot.Cover.Parent = plot.Model:FindFirstChild("Ground")
+	local model = plot.Model
+	pcall(function()
+		model:RemovePersistentPlayer(player)
+	end)
+	model:SetAttribute("OwnerUserId", 0)
+	model:SetAttribute("FossilsTotal", 0)
+	model:SetAttribute("FossilsFound", 0)
+end
+
+-- Public API ---------------------------------------------------------------
+
+function PlotService.GetPlot(player: Player): Plot?
+	return plotByPlayer[player]
+end
+
+function PlotService.GetCellCenter(plot: Plot, index: number): Vector3
+	return DigRules.cellCenter(plot.Origin, index)
+end
+
+-- A cell took damage but is still standing.
+function PlotService.SetCellHealth(plot: Plot, index: number, health: number)
+	local part = plot.CellParts[index]
+	if part then
+		part:SetAttribute("Health", health)
+	end
+end
+
+-- A cell broke: remove its part and show the hints of the cells this exposes.
+function PlotService.RemoveCell(plot: Plot, index: number)
+	local part = plot.CellParts[index]
+	if part then
+		plot.CellParts[index] = nil
+		part:Destroy()
+	end
+	for _, neighbor in GridMath.neighbors(DigRules.Dims, index) do
+		dressCell(plot, neighbor)
+	end
+end
+
+-- Refills and reseeds the plot right now.
+function PlotService.Regenerate(plot: Plot)
+	if plot.Owner == nil then
+		return
+	end
+	generate(plot)
+end
+
+-- Refills and reseeds the plot after GridConfig.RefillDelay seconds.
+function PlotService.ScheduleRefill(plot: Plot)
+	plot.RefillToken += 1
+	local token = plot.RefillToken
+	local delay = GridConfig.RefillDelay
+	plot.Model:SetAttribute("RefillAt", Workspace:GetServerTimeNow() + delay)
+	task.delay(delay, function()
+		if plot.RefillToken == token and plot.Owner ~= nil then
+			generate(plot)
+		end
+	end)
+end
+
+function PlotService.Init()
+	for _, build in WorldBuilder.build() do
+		table.insert(plots, {
+			Id = build.Id,
+			Model = build.Model,
+			Origin = build.Origin,
+			CellsFolder = build.CellsFolder,
+			FossilsFolder = build.FossilsFolder,
+			Cover = build.Cover,
+			Spawn = build.Spawn,
+			Owner = nil,
+			State = nil,
+			CellParts = {},
+			FossilParts = {},
+			Dressed = {},
+			Generation = 0,
+			RefillToken = 0,
+		})
+	end
+end
+
+function PlotService.Start()
+	Players.PlayerAdded:Connect(assign)
+	Players.PlayerRemoving:Connect(release)
+	for _, player in Players:GetPlayers() do
+		task.spawn(assign, player)
+	end
+end
+
+return PlotService
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="30">
+          <Properties>
+            <string name="Name">ToolService</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	ToolService: gives players their digging tools and tracks which one each
+	player is holding.
+
+	The server is the authority on the equipped tool. The client asks with
+	EquipRequest; the server checks the request and does the equipping, and
+	DigService reads GetEquipped() when it rules on a swing.
+
+	Tools are built from greybox parts described in ToolConfig. They are real
+	Roblox Tool objects so the character holds and swings them with Roblox's
+	built-in animations, but the default hotbar is replaced by our own buttons
+	(see ToolController on the client).
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+
+local Shared = ReplicatedStorage.Shared
+local DigConfig = require(Shared.Config.DigConfig)
+local Remotes = require(Shared.Remotes)
+local ToolConfig = require(Shared.Config.ToolConfig)
+
+local RateLimiter = require(script.Parent.Parent.Util.RateLimiter)
+
+local ToolService = {}
+
+-- The tool each player asked to hold. GetEquipped() checks it is really in hand.
+local wantedId: { [Player]: string } = {}
+local toolsByPlayer: { [Player]: { [string]: Tool } } = {}
+local limiter = RateLimiter.new(DigConfig.MaxRequestsPerSecond, DigConfig.RequestBurst)
+
+local function buildTool(toolId: string): Tool
+	local def = ToolConfig.Tools[toolId]
+	local tool = Instance.new("Tool")
+	tool.Name = def.DisplayName
+	tool.CanBeDropped = false
+	tool.ManualActivationOnly = true -- our own input code decides when a swing happens
+	tool.RequiresHandle = true
+	tool.Grip = def.Grip
+	tool:SetAttribute("ToolId", toolId)
+
+	local handle: Part? = nil
+	for index, partDef in def.Parts do
+		local part = Instance.new("Part")
+		part.Name = if index == 1 then "Handle" else partDef.Name
+		part.Size = partDef.Size
+		part.Color = partDef.Color
+		part.Material = Enum.Material.SmoothPlastic
+		part.TopSurface = Enum.SurfaceType.Smooth
+		part.BottomSurface = Enum.SurfaceType.Smooth
+		part.CanCollide = false
+		part.CanQuery = false
+		part.CanTouch = false
+		part.Massless = true
+		part.CFrame = partDef.Offset
+		if handle then
+			local weld = Instance.new("WeldConstraint")
+			weld.Part0 = handle
+			weld.Part1 = part
+			weld.Parent = part
+		else
+			handle = part
+		end
+		part.Parent = tool
+	end
+	return tool
+end
+
+-- The player's tool of this kind, rebuilt if it was destroyed (for example
+-- when the character died).
+local function getTool(player: Player, toolId: string): Tool
+	local tools = toolsByPlayer[player]
+	if tools == nil then
+		tools = {}
+		toolsByPlayer[player] = tools
+	end
+	local tool = tools[toolId]
+	if tool == nil or tool.Parent == nil then
+		tool = buildTool(toolId)
+		tools[toolId] = tool
+	end
+	return tool
+end
+
+-- Puts the player's wanted tool in their hand, if they have a living character.
+local function equip(player: Player)
+	local toolId = wantedId[player] or ToolConfig.DefaultTool
+	local character = player.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if character == nil or humanoid == nil or humanoid.Health <= 0 then
+		return
+	end
+	if not character:IsDescendantOf(Workspace) then
+		return
+	end
+	-- EquipTool also puts whatever was held before back in the Backpack.
+	humanoid:EquipTool(getTool(player, toolId))
+	player:SetAttribute("EquippedTool", toolId)
+end
+
+local function onCharacterAdded(player: Player, character: Model)
+	local humanoid = character:WaitForChild("Humanoid", 10)
+	if humanoid == nil then
+		return
+	end
+	-- A tool can only be held once the character is in the world.
+	local deadline = os.clock() + 10
+	while not character:IsDescendantOf(Workspace) do
+		if os.clock() > deadline or player.Character ~= character then
+			return
+		end
+		task.wait()
+	end
+	equip(player)
+end
+
+local function onPlayerAdded(player: Player)
+	wantedId[player] = ToolConfig.DefaultTool
+	player:SetAttribute("EquippedTool", ToolConfig.DefaultTool)
+	player.CharacterAdded:Connect(function(character: Model)
+		onCharacterAdded(player, character)
+	end)
+	local character = player.Character
+	if character then
+		task.spawn(onCharacterAdded, player, character)
+	end
+end
+
+local function onPlayerRemoving(player: Player)
+	wantedId[player] = nil
+	toolsByPlayer[player] = nil
+	limiter:forget(player)
+end
+
+-- Client -> server. Every argument is untrusted.
+local function onEquipRequest(player: Player, toolId: any)
+	if typeof(toolId) ~= "string" or ToolConfig.Tools[toolId] == nil then
+		return
+	end
+	if not limiter:allow(player) then
+		return
+	end
+	wantedId[player] = toolId
+	equip(player)
+end
+
+local function isHolding(player: Player, toolId: string): boolean
+	local tools = toolsByPlayer[player]
+	local character = player.Character
+	local tool = tools and tools[toolId]
+	return character ~= nil and tool ~= nil and tool.Parent == character
+end
+
+-- The id of the tool the player is really holding right now, or nil.
+-- If their chosen tool has slipped out of their hand (it was unequipped some
+-- other way), the server puts it back first.
+function ToolService.GetEquipped(player: Player): string?
+	local toolId = wantedId[player]
+	if toolId == nil then
+		return nil
+	end
+	if not isHolding(player, toolId) then
+		equip(player)
+	end
+	return if isHolding(player, toolId) then toolId else nil
+end
+
+function ToolService.Start()
+	Remotes.get("EquipRequest").OnServerEvent:Connect(onEquipRequest)
+	Players.PlayerAdded:Connect(onPlayerAdded)
+	Players.PlayerRemoving:Connect(onPlayerRemoving)
+	for _, player in Players:GetPlayers() do
+		task.spawn(onPlayerAdded, player)
+	end
+end
+
+return ToolService
+]]></string>
+          </Properties>
+        </Item>
+      </Item>
+      <Item class="Folder" referent="31">
+        <Properties>
+          <string name="Name">Util</string>
+        </Properties>
+        <Item class="ModuleScript" referent="32">
+          <Properties>
+            <string name="Name">RateLimiter</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	RateLimiter: flood protection for RemoteEvents (a token bucket per player).
+
+	Each player holds up to `burst` tokens and earns `perSecond` tokens every
+	second. Each request costs one token; with none left, the request is dropped.
+]]
+
+local RateLimiter = {}
+RateLimiter.__index = RateLimiter
+
+type Bucket = {
+	Tokens: number,
+	LastRefill: number,
+}
+
+export type RateLimiter = typeof(setmetatable(
+	{} :: {
+		_perSecond: number,
+		_burst: number,
+		_buckets: { [Player]: Bucket },
+	},
+	RateLimiter
+))
+
+function RateLimiter.new(perSecond: number, burst: number): RateLimiter
+	return setmetatable({
+		_perSecond = perSecond,
+		_burst = burst,
+		_buckets = {},
+	}, RateLimiter)
+end
+
+-- True if this player's request may go ahead.
+function RateLimiter.allow(self: RateLimiter, player: Player): boolean
+	local now = os.clock()
+	local bucket = self._buckets[player]
+	if bucket == nil then
+		bucket = { Tokens = self._burst, LastRefill = now }
+		self._buckets[player] = bucket
+	end
+	local earned = (now - bucket.LastRefill) * self._perSecond
+	bucket.Tokens = math.min(self._burst, bucket.Tokens + earned)
+	bucket.LastRefill = now
+	if bucket.Tokens < 1 then
+		return false
+	end
+	bucket.Tokens -= 1
+	return true
+end
+
+-- Call when a player leaves.
+function RateLimiter.forget(self: RateLimiter, player: Player)
+	self._buckets[player] = nil
+end
+
+return RateLimiter
+]]></string>
+          </Properties>
+        </Item>
+      </Item>
+      <Item class="Folder" referent="33">
+        <Properties>
+          <string name="Name">World</string>
+        </Properties>
+        <Item class="ModuleScript" referent="34">
+          <Properties>
+            <string name="Name">WorldBuilder</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	WorldBuilder: builds the greybox dig site out of plain parts at startup.
+
+	Nothing here is hand-placed in Studio and nothing comes from the Toolbox.
+	Sizes come from WorldConfig and GridConfig, so changing the grid resizes
+	the ground around it.
+
+	One plot, seen from above (the player spawns facing the pit):
+
+	        +--------------------------+
+	        |        museum pad        |   back  (-Z)
+	        |                          |
+	        |      +------------+      |
+	        |      |    pit     |      |
+	        |      | (dig grid) |      |
+	        |      +------------+      |
+	        |        spawn pad         |   front (+Z)
+	        +--------------------------+
+]]
+
+local Lighting = game:GetService("Lighting")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+
+local Shared = ReplicatedStorage.Shared
+local GridConfig = require(Shared.Config.GridConfig)
+local WorldConfig = require(Shared.Config.WorldConfig)
+
+export type PlotBuild = {
+	Id: number,
+	Model: Model,
+	Origin: Vector3, -- centre of the pit's top surface
+	CellsFolder: Folder,
+	FossilsFolder: Folder,
+	Cover: Part, -- fills the pit while the plot has no owner
+	Spawn: SpawnLocation,
+}
+
+local WorldBuilder = {}
+
+local function newFolder(name: string, parent: Instance): Folder
+	local folder = Instance.new("Folder")
+	folder.Name = name
+	folder.Parent = parent
+	return folder
+end
+
+local function newBlock(
+	name: string,
+	size: Vector3,
+	position: Vector3,
+	color: Color3,
+	parent: Instance
+): Part
+	local part = Instance.new("Part")
+	part.Name = name
+	part.Anchored = true
+	part.Size = size
+	part.Position = position
+	part.Color = color
+	part.Material = Enum.Material.SmoothPlastic
+	part.TopSurface = Enum.SurfaceType.Smooth
+	part.BottomSurface = Enum.SurfaceType.Smooth
+	part.Parent = parent
+	return part
+end
+
+local function buildMuseumPlaceholder(parent: Instance, origin: Vector3, pitHalfZ: number)
+	local museum = WorldConfig.Museum
+	local padCenterZ = -pitHalfZ - museum.Gap - museum.Size.Z / 2
+	newBlock(
+		"Pad",
+		museum.Size,
+		origin + Vector3.new(0, museum.Size.Y / 2, padCenterZ),
+		museum.Color,
+		parent
+	)
+
+	-- A sign at the back of the pad, facing the pit.
+	local sign = newBlock(
+		"Sign",
+		Vector3.new(12, 5, 0.5),
+		origin + Vector3.new(0, museum.Size.Y + 2.5, padCenterZ - museum.Size.Z / 2 + 0.5),
+		museum.Color,
+		parent
+	)
+	local gui = Instance.new("SurfaceGui")
+	gui.Face = Enum.NormalId.Back -- the +Z face, which looks at the pit
+	gui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
+	gui.PixelsPerStud = 40
+	gui.Parent = sign
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.fromScale(1, 1)
+	label.BackgroundTransparency = 1
+	label.Text = museum.SignText
+	label.TextScaled = true
+	label.Font = Enum.Font.GothamBold
+	label.TextColor3 = Color3.fromRGB(60, 56, 50)
+	label.Parent = gui
+end
+
+local function buildPlot(id: number, origin: Vector3, parent: Instance): PlotBuild
+	local colors = WorldConfig.Colors
+	local cell = GridConfig.CellSize
+	local pitX = GridConfig.Width * cell.X
+	local pitZ = GridConfig.Length * cell.Z
+	local depth = GridConfig.Layers * cell.Y
+	local halfX = pitX / 2
+	local halfZ = pitZ / 2
+	local margin = WorldConfig.PlotMargin
+	local thickness = depth + WorldConfig.BedrockThickness
+	local museum = WorldConfig.Museum
+	local backDepth = museum.Gap + museum.Size.Z + museum.BackMargin
+	local tileX = pitX + margin * 2
+
+	local model = Instance.new("Model")
+	model.Name = `Plot_{id}`
+	-- If instance streaming is on: the owner always has their whole plot
+	-- loaded (PlotService adds them as a persistent player), and everyone
+	-- else receives it in one piece, never half a grid.
+	model.ModelStreamingMode = Enum.ModelStreamingMode.PersistentPerPlayer
+	model:SetAttribute("Origin", origin)
+	model:SetAttribute("OwnerUserId", 0)
+	model:SetAttribute("Generation", 0)
+	model:SetAttribute("FossilsTotal", 0)
+	model:SetAttribute("FossilsFound", 0)
+	model:SetAttribute("RefillAt", 0)
+
+	-- The ground is four slabs around the pit, so the pit is a real hole.
+	local ground = newFolder("Ground", model)
+	local slabY = -thickness / 2
+	newBlock(
+		"RimFront",
+		Vector3.new(tileX, thickness, margin),
+		origin + Vector3.new(0, slabY, halfZ + margin / 2),
+		colors.Ground,
+		ground
+	)
+	newBlock(
+		"RimBack",
+		Vector3.new(tileX, thickness, backDepth),
+		origin + Vector3.new(0, slabY, -halfZ - backDepth / 2),
+		colors.Ground,
+		ground
+	)
+	newBlock(
+		"RimLeft",
+		Vector3.new(margin, thickness, pitZ),
+		origin + Vector3.new(-halfX - margin / 2, slabY, 0),
+		colors.Ground,
+		ground
+	)
+	newBlock(
+		"RimRight",
+		Vector3.new(margin, thickness, pitZ),
+		origin + Vector3.new(halfX + margin / 2, slabY, 0),
+		colors.Ground,
+		ground
+	)
+	newBlock(
+		"Bedrock",
+		Vector3.new(pitX, WorldConfig.BedrockThickness, pitZ),
+		origin + Vector3.new(0, -depth - WorldConfig.BedrockThickness / 2, 0),
+		colors.Bedrock,
+		ground
+	)
+	local cover = newBlock(
+		"Cover",
+		Vector3.new(pitX, depth, pitZ),
+		origin + Vector3.new(0, -depth / 2, 0),
+		colors.Cover,
+		ground
+	)
+
+	-- The spawn pad sits in front of the pit. A character spawns facing the
+	-- pad's front (-Z), which is towards the pit.
+	local spawn = Instance.new("SpawnLocation")
+	spawn.Name = "Spawn"
+	spawn.Anchored = true
+	spawn.Neutral = true
+	spawn.Duration = 0 -- no spawn forcefield
+	spawn.Size = WorldConfig.SpawnPadSize
+	spawn.Position = origin
+		+ Vector3.new(0, WorldConfig.SpawnPadSize.Y / 2, halfZ + WorldConfig.SpawnDistance)
+	spawn.Color = colors.SpawnPad
+	spawn.Material = Enum.Material.SmoothPlastic
+	spawn.TopSurface = Enum.SurfaceType.Smooth
+	spawn.Parent = model
+
+	buildMuseumPlaceholder(newFolder("Museum", model), origin, halfZ)
+
+	local cellsFolder = newFolder("Cells", model)
+	local fossilsFolder = newFolder("Fossils", model)
+
+	model.Parent = parent
+
+	return {
+		Id = id,
+		Model = model,
+		Origin = origin,
+		CellsFolder = cellsFolder,
+		FossilsFolder = fossilsFolder,
+		Cover = cover,
+		Spawn = spawn,
+	}
+end
+
+-- Flat ground around the whole row of plots, so nobody walks off an edge.
+local function buildSurroundings(parent: Instance, rowWidth: number, frontZ: number, backZ: number)
+	local size = WorldConfig.SurroundSize
+	local thickness = WorldConfig.SurroundThickness
+	local y = WorldConfig.SurfaceY - thickness / 2
+	local color = WorldConfig.Colors.Surround
+	local rowDepth = frontZ - backZ
+	local centerZ = (frontZ + backZ) / 2
+
+	newBlock(
+		"West",
+		Vector3.new(size, thickness, rowDepth + size * 2),
+		Vector3.new(-rowWidth / 2 - size / 2, y, centerZ),
+		color,
+		parent
+	)
+	newBlock(
+		"East",
+		Vector3.new(size, thickness, rowDepth + size * 2),
+		Vector3.new(rowWidth / 2 + size / 2, y, centerZ),
+		color,
+		parent
+	)
+	newBlock(
+		"Front",
+		Vector3.new(rowWidth, thickness, size),
+		Vector3.new(0, y, frontZ + size / 2),
+		color,
+		parent
+	)
+	newBlock(
+		"Back",
+		Vector3.new(rowWidth, thickness, size),
+		Vector3.new(0, y, backZ - size / 2),
+		color,
+		parent
+	)
+end
+
+local function applyLighting()
+	local settings = WorldConfig.Lighting
+	if not settings.Apply then
+		return
+	end
+	Lighting.Ambient = settings.Ambient
+	Lighting.OutdoorAmbient = settings.OutdoorAmbient
+	Lighting.Brightness = settings.Brightness
+	Lighting.ClockTime = settings.ClockTime
+end
+
+-- Builds the whole site and returns one record per plot.
+function WorldBuilder.build(): { PlotBuild }
+	local site = newFolder("DigSite", Workspace)
+
+	local cell = GridConfig.CellSize
+	local pitX = GridConfig.Width * cell.X
+	local halfZ = GridConfig.Length * cell.Z / 2
+	local museum = WorldConfig.Museum
+	local tileX = pitX + WorldConfig.PlotMargin * 2
+	local frontZ = halfZ + WorldConfig.PlotMargin
+	local backZ = -halfZ - (museum.Gap + museum.Size.Z + museum.BackMargin)
+	local count = WorldConfig.MaxPlots
+
+	local plots: { PlotBuild } = {}
+	for id = 1, count do
+		local x = (id - (count + 1) / 2) * tileX
+		plots[id] = buildPlot(id, Vector3.new(x, WorldConfig.SurfaceY, 0), site)
+	end
+
+	buildSurroundings(newFolder("Surroundings", site), count * tileX, frontZ, backZ)
+	applyLighting()
+
+	return plots
+end
+
+return WorldBuilder
+]]></string>
+          </Properties>
+        </Item>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="StarterPlayer" referent="35">
+    <Properties>
+      <string name="Name">StarterPlayer</string>
+    </Properties>
+    <Item class="StarterPlayerScripts" referent="36">
+      <Properties>
+        <string name="Name">StarterPlayerScripts</string>
+      </Properties>
+      <Item class="Folder" referent="37">
+        <Properties>
+          <string name="Name">Client</string>
+        </Properties>
+        <Item class="Folder" referent="38">
+          <Properties>
+            <string name="Name">Controllers</string>
+          </Properties>
+          <Item class="ModuleScript" referent="39">
+            <Properties>
+              <string name="Name">DebugController</string>
+              <string name="Source"><![CDATA[--!strict
+--[[
+	DebugController: developer shortcuts for playtesting (keys in DebugConfig).
+
+	  R  refill and reseed your plot right now
+	  X  show / hide a marker over every fossil that is still buried
+
+	The keys only send a request. The server decides whether this player is
+	allowed (see DebugService), so in a published game they do nothing for
+	normal players.
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+
+local Shared = ReplicatedStorage.Shared
+local DebugConfig = require(Shared.Config.DebugConfig)
+local Remotes = require(Shared.Remotes)
+
+local Client = script.Parent.Parent
+local EffectsRoot = require(Client.Effects.EffectsRoot)
+local PlotController = require(script.Parent.PlotController)
+
+local DebugController = {}
+
+local markers: { Instance } = {}
+local showing = false
+
+local function clearMarkers()
+	for _, marker in markers do
+		marker:Destroy()
+	end
+	table.clear(markers)
+end
+
+local function newMarker(size: Vector3, position: Vector3, shape: Enum.PartType)
+	local part = Instance.new("Part")
+	part.Name = "FossilMarker"
+	part.Shape = shape
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanQuery = false
+	part.CanTouch = false
+	part.CastShadow = false
+	part.Material = Enum.Material.Neon
+	part.Color = DebugConfig.MarkerColor
+	part.Size = size
+	part.Position = position
+	part.Parent = EffectsRoot.Folder
+	table.insert(markers, part)
+end
+
+-- Server -> client: the cells that still hide a fossil.
+local function onDebugFossils(cellIndices: any)
+	clearMarkers()
+	local origin = PlotController.getOrigin()
+	if not showing or origin == nil or typeof(cellIndices) ~= "table" then
+		return
+	end
+	for _, index in cellIndices do
+		local center = if typeof(index) == "number"
+			then PlotController.getCellCenter(index)
+			else nil
+		if center then
+			-- A ball floating above the column, and a thin line down to the fossil.
+			local top = Vector3.new(center.X, origin.Y + 3, center.Z)
+			newMarker(Vector3.new(1.2, 1.2, 1.2), top, Enum.PartType.Ball)
+			newMarker(
+				Vector3.new(0.2, top.Y - center.Y, 0.2),
+				(top + center) / 2,
+				Enum.PartType.Block
+			)
+		end
+	end
+end
+
+local function onInputBegan(input: InputObject, processedByUi: boolean)
+	if processedByUi or input.UserInputType ~= Enum.UserInputType.Keyboard then
+		return
+	end
+	if input.KeyCode == DebugConfig.Keys.Reseed then
+		Remotes.get("DebugRequest"):FireServer("Reseed")
+	elseif input.KeyCode == DebugConfig.Keys.ShowFossils then
+		showing = not showing
+		if showing then
+			Remotes.get("DebugRequest"):FireServer("ShowFossils")
+		else
+			clearMarkers()
+		end
+	end
+end
+
+function DebugController.Start()
+	if not DebugConfig.Enabled then
+		return
+	end
+	Remotes.get("DebugFossils").OnClientEvent:Connect(onDebugFossils)
+	UserInputService.InputBegan:Connect(onInputBegan)
+
+	-- A reseeded plot has new fossils: refresh the markers if they are on.
+	PlotController.Regenerated:Connect(function()
+		clearMarkers()
+		if showing then
+			Remotes.get("DebugRequest"):FireServer("ShowFossils")
+		end
+	end)
+end
+
+return DebugController
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="40">
+            <Properties>
+              <string name="Name">DigController</string>
+              <string name="Source"><![CDATA[--!strict
+--[[
+	DigController: turns clicks and taps into swings.
+
+	What the client does:
+	  1. Finds what the click or tap hit in the player's own plot.
+	  2. PREDICTS the result with the same rules the server uses (DigRules),
+	     and plays the feedback immediately, so digging never waits on the
+	     network.
+	  3. Sends the server one small message: "I swung at cell N".
+
+	What the client does NOT do: decide anything. The server re-checks the
+	swing and answers with SwingResult. If it disagrees (rare: lag, or a
+	tampered client), the prediction is undone here.
+
+	Controls: left click (hold to keep swinging) on PC, tap on mobile.
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+
+local Shared = ReplicatedStorage.Shared
+local DigConfig = require(Shared.Config.DigConfig)
+local DigRules = require(Shared.Dig.DigRules)
+local FeelConfig = require(Shared.Config.FeelConfig)
+local MaterialConfig = require(Shared.Config.MaterialConfig)
+local Remotes = require(Shared.Remotes)
+local ToolConfig = require(Shared.Config.ToolConfig)
+
+local Client = script.Parent.Parent
+local CellVisuals = require(Client.Effects.CellVisuals)
+local EffectsController = require(script.Parent.EffectsController)
+local FossilController = require(script.Parent.FossilController)
+local PlotController = require(script.Parent.PlotController)
+local ToolController = require(script.Parent.ToolController)
+
+-- A swing we have sent and predicted, waiting for the server's ruling.
+type PendingSwing = {
+	Kind: "Cell" | "Fossil",
+	Index: number,
+	Part: BasePart,
+	Amount: number, -- predicted damage (cell) or cleaning strokes (fossil)
+	PredictedBreak: boolean,
+	PredictedReveal: boolean,
+	SentAt: number,
+}
+
+local DigController = {}
+
+local player = Players.LocalPlayer
+
+local sequence = 0
+local pending: { [number]: PendingSwing } = {}
+-- Per part: the last value the server confirmed (cell health, or strokes done
+-- on a crust), and the predicted change it has not confirmed yet.
+local confirmed: { [BasePart]: number } = {}
+local unconfirmed: { [BasePart]: number } = {}
+
+local nextSwingAt = 0
+local mouseHeld = false
+local lastPendingSweep = 0
+
+local function getRootPosition(): Vector3?
+	local character = player.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if root and root:IsA("BasePart") then
+		return root.Position
+	end
+	return nil
+end
+
+local function numberAttribute(part: BasePart, name: string): number
+	local value = part:GetAttribute(name)
+	return if typeof(value) == "number" then value else 0
+end
+
+-- The server-confirmed value for a part, read from its attribute the first time.
+local function confirmedValue(target: PlotController.Target): number
+	local known = confirmed[target.Part]
+	if known == nil then
+		known = numberAttribute(target.Part, if target.Kind == "Cell" then "Health" else "Clean")
+		confirmed[target.Part] = known
+	end
+	return known
+end
+
+local function cellDamageFraction(part: BasePart, health: number): number
+	local materialId = part:GetAttribute("Mat")
+	local material = if typeof(materialId) == "string"
+		then MaterialConfig.Materials[materialId]
+		else nil
+	if material == nil or material.Health <= 0 then
+		return 0
+	end
+	return 1 - health / material.Health
+end
+
+local function send(
+	target: PlotController.Target,
+	amount: number,
+	willBreak: boolean,
+	willReveal: boolean
+)
+	sequence += 1
+	pending[sequence] = {
+		Kind = target.Kind,
+		Index = target.Index,
+		Part = target.Part,
+		Amount = amount,
+		PredictedBreak = willBreak,
+		PredictedReveal = willReveal,
+		SentAt = os.clock(),
+	}
+	unconfirmed[target.Part] = (unconfirmed[target.Part] or 0) + amount
+	Remotes.get("SwingRequest"):FireServer(sequence, target.Index)
+end
+
+-- The wrong tool was used: play the cue and point at a tool that would work.
+local function wrongTool(target: PlotController.Target)
+	EffectsController.wrongTool(target.Part)
+	local materialId = target.Part:GetAttribute("Mat")
+	for otherId in ToolConfig.Tools do
+		local works: boolean
+		if target.Kind == "Cell" then
+			works = typeof(materialId) == "string" and DigRules.getDamage(otherId, materialId) > 0
+		else
+			works = DigRules.getCleanPower(otherId) > 0
+		end
+		if works then
+			ToolController.nudge(otherId)
+			return
+		end
+	end
+end
+
+local function swingAtCell(target: PlotController.Target, toolId: string)
+	local materialId = target.Part:GetAttribute("Mat")
+	if typeof(materialId) ~= "string" then
+		return
+	end
+	local damage = DigRules.getDamage(toolId, materialId)
+	if damage <= 0 then
+		wrongTool(target)
+		return
+	end
+
+	local health = confirmedValue(target) - (unconfirmed[target.Part] or 0) - damage
+	local willBreak = health <= 0
+	send(target, damage, willBreak, false)
+
+	if willBreak then
+		PlotController.setLocallyBroken(target.Index, true)
+		FossilController.noteBreak(target.Index)
+		EffectsController.cellBreak(target.Part, materialId)
+	else
+		EffectsController.cellHit(
+			target.Part,
+			materialId,
+			target.Position,
+			target.Normal,
+			cellDamageFraction(target.Part, health)
+		)
+	end
+end
+
+local function swingAtFossil(target: PlotController.Target, toolId: string)
+	local power = DigRules.getCleanPower(toolId)
+	if power <= 0 then
+		wrongTool(target)
+		return
+	end
+
+	local needed = math.max(numberAttribute(target.Part, "CleanNeeded"), 1)
+	local done = confirmedValue(target) + (unconfirmed[target.Part] or 0) + power
+	local willReveal = done >= needed
+	send(target, power, false, willReveal)
+
+	EffectsController.crustBrush(target.Part, target.Position, target.Normal, done / needed)
+	if willReveal then
+		FossilController.beginReveal(target.Index, target.Part)
+	end
+end
+
+-- One swing attempt along a ray from the camera.
+local function trySwing(origin: Vector3, direction: Vector3)
+	local now = os.clock()
+	if now < nextSwingAt or FossilController.isBusy() then
+		return
+	end
+
+	local target = PlotController.raycast(origin, direction * DigConfig.MaxRayDistance)
+	if target == nil then
+		return
+	end
+	if target.Kind == "Cell" and not PlotController.isExposed(target.Index) then
+		return
+	end
+	if target.Kind == "Fossil" and target.Part:GetAttribute("Stage") ~= "Encased" then
+		return
+	end
+
+	local toolId = ToolController.getEquipped()
+	local tool = ToolConfig.Tools[toolId]
+	local rootPosition = getRootPosition()
+	local cellCenter = PlotController.getCellCenter(target.Index)
+	if tool == nil or rootPosition == nil or cellCenter == nil then
+		return
+	end
+
+	if DigRules.distanceToCell(rootPosition, cellCenter) > tool.Range then
+		nextSwingAt = now + FeelConfig.TooFar.RetryDelay
+		EffectsController.tooFar(target.Part)
+		return
+	end
+
+	nextSwingAt = now + tool.Cooldown
+	ToolController.playSwing()
+	if target.Kind == "Cell" then
+		swingAtCell(target, toolId)
+	else
+		swingAtFossil(target, toolId)
+	end
+end
+
+local function swingAtMouse()
+	local camera = Workspace.CurrentCamera
+	if camera == nil then
+		return
+	end
+	local location = UserInputService:GetMouseLocation()
+	local ray = camera:ViewportPointToRay(location.X, location.Y)
+	trySwing(ray.Origin, ray.Direction)
+end
+
+-- Puts a cell back the way the server says it is, after a wrong prediction.
+local function restoreCell(entry: PendingSwing)
+	local part = entry.Part
+	if part.Parent == nil then
+		return
+	end
+	if entry.PredictedBreak then
+		PlotController.setLocallyBroken(entry.Index, false)
+		CellVisuals.show(part)
+	end
+	local health = (confirmed[part] or 0) - (unconfirmed[part] or 0)
+	CellVisuals.setCellDamage(part, cellDamageFraction(part, health))
+end
+
+local function restoreCrust(entry: PendingSwing)
+	local part = entry.Part
+	if entry.PredictedReveal then
+		FossilController.cancelReveal(entry.Index)
+	end
+	if part.Parent == nil then
+		return
+	end
+	local needed = math.max(numberAttribute(part, "CleanNeeded"), 1)
+	local done = (confirmed[part] or 0) + (unconfirmed[part] or 0)
+	CellVisuals.setCrustClean(part, done / needed)
+end
+
+-- Applies the server's ruling on one swing.
+local function settle(entry: PendingSwing, ok: boolean, code: string, value: number, defId: string?)
+	local part = entry.Part
+	local remaining = (unconfirmed[part] or 0) - entry.Amount
+	unconfirmed[part] = if remaining > 0 then remaining else nil
+	if ok then
+		confirmed[part] = value
+	end
+
+	if entry.Kind == "Cell" then
+		if ok and code == "Break" then
+			if not entry.PredictedBreak and part.Parent ~= nil then
+				-- The server broke a cell we expected to survive. Catch up.
+				local materialId = part:GetAttribute("Mat")
+				PlotController.setLocallyBroken(entry.Index, true)
+				FossilController.noteBreak(entry.Index)
+				if typeof(materialId) == "string" then
+					EffectsController.cellBreak(part, materialId)
+				end
+			end
+		elseif not ok or entry.PredictedBreak then
+			restoreCell(entry)
+		end
+	else
+		if ok and code == "Reveal" and defId then
+			FossilController.confirmReveal(entry.Index, defId)
+		elseif not ok or entry.PredictedReveal then
+			restoreCrust(entry)
+		end
+	end
+end
+
+-- Server -> client. Arguments are checked before use.
+local function onSwingResult(seq: any, ok: any, code: any, value: any, defId: any)
+	if typeof(seq) ~= "number" then
+		return
+	end
+	local entry = pending[seq]
+	if entry == nil then
+		return
+	end
+	pending[seq] = nil
+	settle(
+		entry,
+		ok == true,
+		if typeof(code) == "string" then code else "",
+		if typeof(value) == "number" then value else 0,
+		if typeof(defId) == "string" then defId else nil
+	)
+end
+
+-- A swing the server never answered is treated as rejected.
+local function sweepPending(now: number)
+	for seq, entry in pending do
+		if now - entry.SentAt > DigConfig.PendingTimeout then
+			pending[seq] = nil
+			settle(entry, false, "Timeout", 0, nil)
+		end
+	end
+end
+
+local function updateHover()
+	if not FeelConfig.Hover.Enabled then
+		return
+	end
+	local camera = Workspace.CurrentCamera
+	if
+		camera == nil
+		or not UserInputService.MouseEnabled
+		or UserInputService:GetLastInputType() == Enum.UserInputType.Touch
+	then
+		EffectsController.setHover(nil, nil)
+		return
+	end
+
+	local location = UserInputService:GetMouseLocation()
+	local ray = camera:ViewportPointToRay(location.X, location.Y)
+	local target = PlotController.raycast(ray.Origin, ray.Direction * DigConfig.MaxRayDistance)
+	if target == nil then
+		EffectsController.setHover(nil, nil)
+		return
+	end
+	if target.Kind == "Cell" and not PlotController.isExposed(target.Index) then
+		EffectsController.setHover(nil, nil)
+		return
+	end
+	if target.Kind == "Fossil" and target.Part:GetAttribute("Stage") ~= "Encased" then
+		EffectsController.setHover(nil, nil)
+		return
+	end
+
+	local toolId = ToolController.getEquipped()
+	local tool = ToolConfig.Tools[toolId]
+	local rootPosition = getRootPosition()
+	local cellCenter = PlotController.getCellCenter(target.Index)
+	if tool == nil or rootPosition == nil or cellCenter == nil then
+		EffectsController.setHover(nil, nil)
+		return
+	end
+
+	local works: boolean
+	if target.Kind == "Cell" then
+		local materialId = target.Part:GetAttribute("Mat")
+		works = typeof(materialId) == "string" and DigRules.getDamage(toolId, materialId) > 0
+	else
+		works = DigRules.getCleanPower(toolId) > 0
+	end
+
+	if DigRules.distanceToCell(rootPosition, cellCenter) > tool.Range then
+		EffectsController.setHover(target.Part, "TooFar")
+	elseif works then
+		EffectsController.setHover(target.Part, "Valid")
+	else
+		EffectsController.setHover(target.Part, "WrongTool")
+	end
+end
+
+local function forgetPart(_index: number, part: BasePart)
+	confirmed[part] = nil
+	unconfirmed[part] = nil
+	CellVisuals.forget(part)
+end
+
+function DigController.Start()
+	Remotes.get("SwingResult").OnClientEvent:Connect(onSwingResult)
+
+	PlotController.CellRemoved:Connect(forgetPart)
+	PlotController.FossilRemoved:Connect(forgetPart)
+
+	-- PC: click, or hold to keep swinging.
+	UserInputService.InputBegan:Connect(function(input: InputObject, processedByUi: boolean)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 and not processedByUi then
+			mouseHeld = true
+			swingAtMouse()
+		end
+	end)
+	UserInputService.InputEnded:Connect(function(input: InputObject)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			mouseHeld = false
+		end
+	end)
+	UserInputService.WindowFocusReleased:Connect(function()
+		mouseHeld = false
+	end)
+
+	-- Mobile: one tap, one swing. Taps on buttons arrive as processedByUi.
+	UserInputService.TouchTapInWorld:Connect(function(position: Vector2, processedByUi: boolean)
+		local camera = Workspace.CurrentCamera
+		if processedByUi or camera == nil then
+			return
+		end
+		local ray = camera:ScreenPointToRay(position.X, position.Y)
+		trySwing(ray.Origin, ray.Direction)
+	end)
+
+	RunService.RenderStepped:Connect(function()
+		local now = os.clock()
+		if mouseHeld and DigConfig.HoldToRepeat then
+			swingAtMouse()
+		end
+		updateHover()
+		if now - lastPendingSweep > 0.5 then
+			lastPendingSweep = now
+			sweepPending(now)
+		end
+	end)
+end
+
+return DigController
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="41">
+            <Properties>
+              <string name="Name">EffectsController</string>
+              <string name="Source"><![CDATA[--!strict
+--[[
+	EffectsController: turns "a swing did X" into sound, particles, camera
+	shake and movement. This is where the feel of digging is assembled; the
+	numbers all come from FeelConfig and SoundConfig.
+
+	It only plays effects. It never decides what a swing does (DigController
+	predicts that, and the server has the final say).
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local Shared = ReplicatedStorage.Shared
+local FeelConfig = require(Shared.Config.FeelConfig)
+
+local Client = script.Parent.Parent
+local CameraFx = require(Client.Effects.CameraFx)
+local CellVisuals = require(Client.Effects.CellVisuals)
+local DebrisField = require(Client.Effects.DebrisField)
+local EffectsRoot = require(Client.Effects.EffectsRoot)
+local ParticlePool = require(Client.Effects.ParticlePool)
+local SoundPlayer = require(Client.Effects.SoundPlayer)
+local TimeScale = require(Client.Effects.TimeScale)
+
+export type HoverState = "Valid" | "WrongTool" | "TooFar"
+
+local EffectsController = {}
+
+local random = Random.new()
+local comboCount = 0
+local lastHitAt = 0
+
+local hoverBox: SelectionBox? = nil
+local flashBox: SelectionBox? = nil
+local flashToken = 0
+
+-- Pitch for the next hit sound: rises while hits keep landing, resets after a pause.
+local function nextComboPitch(): number
+	local combo = FeelConfig.Combo
+	local now = os.clock()
+	if now - lastHitAt > combo.Window then
+		comboCount = 0
+	else
+		comboCount = math.min(comboCount + 1, combo.MaxSteps)
+	end
+	lastHitAt = now
+	local jitter = random:NextNumber(-combo.PitchJitter, combo.PitchJitter)
+	return 1 + comboCount * combo.PitchStep + jitter
+end
+
+local function newSelectionBox(name: string): SelectionBox
+	local box = Instance.new("SelectionBox")
+	box.Name = name
+	box.LineThickness = FeelConfig.Hover.LineThickness
+	box.SurfaceTransparency = 1
+	box.Parent = EffectsRoot.Folder
+	return box
+end
+
+-- A hit landed on a cell and it is still standing.
+--   damageFraction  0 = untouched, 1 = about to break
+function EffectsController.cellHit(
+	part: BasePart,
+	materialId: string,
+	position: Vector3,
+	normal: Vector3,
+	damageFraction: number
+)
+	local feel = FeelConfig.Materials[materialId]
+	if feel == nil then
+		return
+	end
+	SoundPlayer.play(feel.HitSound, nextComboPitch())
+	ParticlePool.emit(feel.HitParticles, position, normal)
+	CellVisuals.setCellDamage(part, damageFraction)
+	CellVisuals.punch(part)
+	CameraFx.shake(feel.HitShake)
+end
+
+-- A cell broke: crumble it and hide it.
+function EffectsController.cellBreak(part: BasePart, materialId: string)
+	local feel = FeelConfig.Materials[materialId]
+	if feel == nil then
+		return
+	end
+	SoundPlayer.play(feel.BreakSound, nextComboPitch())
+	ParticlePool.emit(feel.BreakParticles, part.Position)
+	DebrisField.burst(part.Position, part.Size, part.Color, part.Material, feel.DebrisCount)
+	CellVisuals.hide(part)
+	CameraFx.shake(feel.BreakShake)
+end
+
+-- A brush stroke landed on a fossil's crust.
+--   cleanFraction  0 = just exposed, 1 = fully brushed
+function EffectsController.crustBrush(
+	part: BasePart,
+	position: Vector3,
+	normal: Vector3,
+	cleanFraction: number
+)
+	local crust = FeelConfig.Crust
+	SoundPlayer.play(crust.BrushSound, nextComboPitch())
+	ParticlePool.emit(crust.BrushParticles, position, normal)
+	CellVisuals.setCrustClean(part, cleanFraction)
+	CellVisuals.wiggle(part, crust.Wobble, crust.WobbleTime)
+end
+
+-- A crusted fossil appeared where a cell just broke.
+function EffectsController.fossilFound(part: BasePart)
+	local crust = FeelConfig.Crust
+	SoundPlayer.play(crust.FoundSound)
+	ParticlePool.emit(crust.FoundParticles, part.Position)
+	CellVisuals.wiggle(part, crust.Wobble, crust.WobbleTime * 2)
+end
+
+-- The tool in hand cannot affect what was hit.
+function EffectsController.wrongTool(part: BasePart)
+	local feel = FeelConfig.WrongTool
+	comboCount = 0
+	SoundPlayer.play(feel.Sound)
+	CellVisuals.wiggle(part, feel.Wiggle, feel.WiggleTime)
+end
+
+-- The target is out of reach: flash its outline.
+function EffectsController.tooFar(part: BasePart)
+	local feel = FeelConfig.TooFar
+	SoundPlayer.play(feel.Sound)
+
+	local box = flashBox or newSelectionBox("TooFarFlash")
+	flashBox = box
+	box.Color3 = feel.Color
+	box.Adornee = part
+	box.Visible = true
+	flashToken += 1
+	local token = flashToken
+	task.delay(feel.FlashTime, function()
+		if flashToken == token then
+			box.Visible = false
+		end
+	end)
+end
+
+-- PC only: outline whatever is under the cursor. Pass nil to clear it.
+function EffectsController.setHover(part: BasePart?, state: HoverState?)
+	local hover = FeelConfig.Hover
+	if not hover.Enabled then
+		return
+	end
+	if part == nil then
+		-- Nothing to outline. On a phone the box is never even created.
+		if hoverBox then
+			hoverBox.Visible = false
+		end
+		return
+	end
+	local box = hoverBox or newSelectionBox("Hover")
+	hoverBox = box
+	box.Visible = true
+	box.Adornee = part
+	if state == "WrongTool" then
+		box.Color3 = hover.WrongToolColor
+	elseif state == "TooFar" then
+		box.Color3 = hover.TooFarColor
+	else
+		box.Color3 = hover.ValidColor
+	end
+end
+
+-- The plot was refilled with fresh ground.
+function EffectsController.plotRefilled(center: Vector3)
+	local refill = FeelConfig.Refill
+	SoundPlayer.play(refill.Sound)
+	ParticlePool.emit(refill.Particles, center)
+	comboCount = 0
+end
+
+function EffectsController.Start()
+	SoundPlayer.preload()
+	CameraFx.start()
+
+	RunService.RenderStepped:Connect(function(realDelta: number)
+		local delta = TimeScale.step(realDelta)
+		local scale = TimeScale.get()
+
+		-- Slow motion also slows particles and pitches new sounds down.
+		ParticlePool.setTimeScale(scale)
+		local slowPitch = FeelConfig.Reveal.SlowPitch
+		SoundPlayer.setGlobalPitch(if scale < 1 then slowPitch + (1 - slowPitch) * scale else 1)
+
+		CellVisuals.step(delta)
+		DebrisField.step(delta)
+	end)
+end
+
+return EffectsController
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="42">
+            <Properties>
+              <string name="Name">FossilController</string>
+              <string name="Source"><![CDATA[--!strict
+--[[
+	FossilController: the fossil side of digging on this client. The crust
+	appearing, and above all the big moment when a fossil is uncovered.
+
+	The reveal, step by step:
+	  1. The final brush stroke lands. We know it is the last one (the crust
+	     tells us how many strokes it needs), so time slows at once: crust
+	     shards burst off in slow motion, the camera pushes in, digging pauses.
+	  2. Meanwhile the server confirms the reveal and tells us WHICH fossil it
+	     is. The slow motion hides that short wait.
+	  3. Time snaps back: the fossil pops out of the ground and spins up to
+	     hover above the plot, glowing in its rarity colour, with sparkles, a
+	     rising chime and a name tag. Rarer fossils hold the slow motion a
+	     beat longer and get a bigger burst.
+
+	Everything here is cosmetic and local. If the server does not confirm, the
+	moment is quietly cancelled.
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+
+local Shared = ReplicatedStorage.Shared
+local FeelConfig = require(Shared.Config.FeelConfig)
+local FossilConfig = require(Shared.Config.FossilConfig)
+local RarityConfig = require(Shared.Config.RarityConfig)
+
+local Client = script.Parent.Parent
+local CameraFx = require(Client.Effects.CameraFx)
+local CellVisuals = require(Client.Effects.CellVisuals)
+local DebrisField = require(Client.Effects.DebrisField)
+local EffectsController = require(script.Parent.EffectsController)
+local ParticlePool = require(Client.Effects.ParticlePool)
+local PlotController = require(script.Parent.PlotController)
+local SoundPlayer = require(Client.Effects.SoundPlayer)
+local TimeScale = require(Client.Effects.TimeScale)
+
+-- A reveal that has started but whose fossil has not popped out yet.
+type PendingReveal = {
+	Index: number,
+	Part: BasePart,
+	StartedAt: number,
+	DefId: string?, -- set once the server confirms
+}
+
+-- An uncovered fossil on display above the plot.
+type Display = {
+	Part: BasePart,
+	Rotation: CFrame,
+	Size: Vector3,
+	From: Vector3,
+	To: Vector3,
+	PopStart: number, -- 0 once the pop has finished
+	Angle: number,
+	Light: PointLight,
+	Highlight: Highlight,
+	Intensity: number,
+}
+
+local RECENT_BREAK_WINDOW = 3 -- seconds
+
+local FossilController = {}
+
+local reveal = FeelConfig.Reveal
+local pending: PendingReveal? = nil
+local lockedUntil = 0
+local displays: { [BasePart]: Display } = {}
+local recentBreaks: { [number]: number } = {}
+
+local function rotationOf(def: FossilConfig.FossilDef): CFrame
+	return CFrame.Angles(
+		math.rad(def.Rotation.X),
+		math.rad(def.Rotation.Y),
+		math.rad(def.Rotation.Z)
+	)
+end
+
+local function easeOut(alpha: number): number
+	return 1 - (1 - alpha) * (1 - alpha)
+end
+
+-- Scale during the pop: grows past full size, then settles back.
+local function popScale(alpha: number): number
+	local peak = 0.6
+	if alpha < peak then
+		return reveal.PopStartScale
+			+ (reveal.PopOvershoot - reveal.PopStartScale) * easeOut(alpha / peak)
+	end
+	return reveal.PopOvershoot + (1 - reveal.PopOvershoot) * easeOut((alpha - peak) / (1 - peak))
+end
+
+local function buildLabel(
+	part: BasePart,
+	def: FossilConfig.FossilDef,
+	rarity: RarityConfig.RarityDef
+)
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = "FossilLabel"
+	billboard.Adornee = part
+	-- For a BillboardGui, Scale is measured in studs, so the tag keeps its
+	-- size in the world on every screen.
+	billboard.Size = UDim2.fromScale(reveal.LabelWidth, reveal.LabelHeight)
+	billboard.StudsOffsetWorldSpace = Vector3.new(0, reveal.LabelOffset, 0)
+	billboard.AlwaysOnTop = true
+	billboard.LightInfluence = 0
+	billboard.MaxDistance = 150
+
+	local scale = Instance.new("UIScale")
+	scale.Scale = 0
+	scale.Parent = billboard
+
+	local name = Instance.new("TextLabel")
+	name.Name = "FossilName"
+	name.Size = UDim2.fromScale(1, 0.6)
+	name.BackgroundTransparency = 1
+	name.Text = def.DisplayName
+	name.TextScaled = true
+	name.Font = Enum.Font.GothamBold
+	name.TextColor3 = Color3.new(1, 1, 1)
+	name.TextStrokeTransparency = 0.3
+	name.Parent = billboard
+
+	local tier = Instance.new("TextLabel")
+	tier.Name = "Rarity"
+	tier.Position = UDim2.fromScale(0, 0.6)
+	tier.Size = UDim2.fromScale(1, 0.4)
+	tier.BackgroundTransparency = 1
+	tier.Text = rarity.DisplayName
+	tier.TextScaled = true
+	tier.Font = Enum.Font.GothamBold
+	tier.TextColor3 = rarity.Color
+	tier.TextStrokeTransparency = 0.3
+	tier.Parent = billboard
+
+	billboard.Parent = part
+	local popIn = TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+	TweenService:Create(scale, popIn, { Scale = 1 }):Play()
+end
+
+-- Turns an uncovered fossil into a glowing, labelled display piece.
+--   animate  true = play the pop; false = it was already uncovered when we first saw it
+local function display(index: number, part: BasePart, defId: string, animate: boolean)
+	local def = FossilConfig.ById[defId]
+	local origin = PlotController.getOrigin()
+	local cellCenter = PlotController.getCellCenter(index)
+	if def == nil or origin == nil or cellCenter == nil or displays[part] then
+		return
+	end
+	local rarity = RarityConfig.Rarities[def.Rarity]
+	local feel = reveal.ByRarity[def.Rarity]
+	if rarity == nil or feel == nil then
+		return
+	end
+
+	-- From here on this controller animates the part.
+	CellVisuals.forget(part)
+	-- Make it look like the fossil right away, in case the server's own
+	-- update of the part has not reached us yet.
+	if part:IsA("Part") then
+		part.Shape = def.Shape
+	end
+	part.Material = FossilConfig.RevealedMaterial
+	part.Color = def.Color
+	part.CanQuery = false -- a display piece never blocks a click on the grid
+
+	local light = Instance.new("PointLight")
+	light.Color = rarity.Color
+	light.Range = reveal.LightRange
+	light.Brightness = reveal.LightBrightnessStart * feel.Intensity
+	light.Parent = part
+
+	local highlight = Instance.new("Highlight")
+	highlight.Adornee = part
+	highlight.FillColor = rarity.Color
+	highlight.OutlineColor = Color3.new(1, 1, 1)
+	highlight.FillTransparency = reveal.FillTransparencyStart
+	highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	highlight.Parent = part
+
+	local sparkles = ParticlePool.newEmitter(reveal.SparkleParticles, part)
+	if sparkles then
+		sparkles.Color = ColorSequence.new(rarity.Color)
+		sparkles.Speed = NumberRange.new(1, 3)
+		sparkles.Rate = reveal.IdleSparkleRate
+		sparkles.Enabled = true
+	end
+
+	buildLabel(part, def, rarity)
+
+	local hover = Vector3.new(cellCenter.X, origin.Y + reveal.HoverHeight, cellCenter.Z)
+	local entry: Display = {
+		Part = part,
+		Rotation = rotationOf(def),
+		Size = def.Size,
+		From = cellCenter,
+		To = hover,
+		PopStart = if animate then os.clock() else 0,
+		Angle = 0,
+		Light = light,
+		Highlight = highlight,
+		Intensity = feel.Intensity,
+	}
+	displays[part] = entry
+
+	if animate then
+		local fade =
+			TweenInfo.new(reveal.GlowFadeTime, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+		TweenService:Create(light, fade, { Brightness = reveal.LightBrightnessEnd }):Play()
+		TweenService:Create(highlight, fade, { FillTransparency = reveal.FillTransparencyEnd })
+			:Play()
+		task.delay(reveal.GlowFadeTime, function()
+			highlight.DepthMode = Enum.HighlightDepthMode.Occluded
+		end)
+
+		CameraFx.setFovOffset(0, reveal.FovRelease)
+		CameraFx.shake(feel.Shake)
+		SoundPlayer.play(feel.Sound)
+		ParticlePool.emit(reveal.SparkleParticles, hover, nil, feel.Intensity, rarity.Color)
+	else
+		light.Brightness = reveal.LightBrightnessEnd
+		highlight.FillTransparency = reveal.FillTransparencyEnd
+		highlight.DepthMode = Enum.HighlightDepthMode.Occluded
+		part.Size = def.Size
+		part.CFrame = CFrame.new(hover) * entry.Rotation
+	end
+end
+
+local function finishPending(current: PendingReveal, defId: string)
+	pending = nil
+	lockedUntil = os.clock() + reveal.InputLockAfterPop
+	if current.Part.Parent ~= nil then
+		display(current.Index, current.Part, defId, true)
+	else
+		CameraFx.setFovOffset(0, reveal.FovRelease)
+	end
+end
+
+local function abandonPending()
+	pending = nil
+	TimeScale.cancel()
+	CameraFx.setFovOffset(0, reveal.FovRelease)
+end
+
+local function step(delta: number)
+	local now = os.clock()
+
+	local current = pending
+	if current then
+		local defId = current.DefId
+		if defId then
+			if now >= TimeScale.holdEndsAt() then
+				finishPending(current, defId)
+			end
+		elseif now - current.StartedAt > reveal.MaxWaitForServer then
+			abandonPending()
+		end
+	end
+
+	for part, entry in displays do
+		if part.Parent == nil then
+			displays[part] = nil
+			continue
+		end
+		local position = entry.To
+		local scale = 1
+		if entry.PopStart > 0 then
+			local alpha = math.clamp((now - entry.PopStart) / reveal.PopDuration, 0, 1)
+			position = entry.From:Lerp(entry.To, easeOut(alpha))
+			scale = popScale(alpha)
+			entry.Angle = reveal.SpinTurns * math.pi * 2 * easeOut(alpha)
+			if alpha >= 1 then
+				entry.PopStart = 0
+			end
+		else
+			entry.Angle += math.rad(reveal.IdleSpinSpeed) * delta
+		end
+		part.Size = entry.Size * scale
+		part.CFrame = CFrame.new(position) * CFrame.Angles(0, entry.Angle, 0) * entry.Rotation
+	end
+end
+
+local function onFossilAdded(index: number, part: BasePart)
+	local defId = part:GetAttribute("DefId")
+	if part:GetAttribute("Stage") == "Revealed" and typeof(defId) == "string" then
+		display(index, part, defId, false)
+		return
+	end
+
+	local clean = part:GetAttribute("Clean")
+	local needed = part:GetAttribute("CleanNeeded")
+	if typeof(clean) == "number" and typeof(needed) == "number" and needed > 0 then
+		CellVisuals.setCrustClean(part, clean / needed)
+	end
+
+	-- Celebrate only a crust that our own digging just exposed.
+	local brokenAt = recentBreaks[index]
+	if brokenAt and os.clock() - brokenAt < RECENT_BREAK_WINDOW then
+		recentBreaks[index] = nil
+		EffectsController.fossilFound(part)
+	end
+end
+
+local function onFossilRemoved(_index: number, part: BasePart)
+	displays[part] = nil
+	CellVisuals.forget(part)
+	local current = pending
+	if current and current.Part == part then
+		abandonPending()
+	end
+end
+
+-- Public API ---------------------------------------------------------------
+
+-- True while the reveal moment is playing; digging is paused.
+function FossilController.isBusy(): boolean
+	return pending ~= nil or os.clock() < lockedUntil
+end
+
+-- DigController calls this when it predicts a cell has broken, so we know a
+-- crust appearing there is the player's own find.
+function FossilController.noteBreak(index: number)
+	recentBreaks[index] = os.clock()
+end
+
+-- Step 1: the final brush stroke was just predicted.
+function FossilController.beginReveal(index: number, part: BasePart)
+	if pending then
+		return
+	end
+	pending = { Index = index, Part = part, StartedAt = os.clock(), DefId = nil }
+
+	-- The server is about to reshape this part into the fossil. Stop our own
+	-- brush wobble so it does not fight that update.
+	CellVisuals.stopReaction(part)
+
+	TimeScale.slow(reveal.SlowTimeScale, reveal.SlowDuration, reveal.RecoverDuration)
+	CameraFx.setFovOffset(reveal.FovKick, reveal.FovAttack)
+	SoundPlayer.play(reveal.StartSound)
+	DebrisField.burst(
+		part.Position,
+		part.Size,
+		FossilConfig.Crust.CleanColor,
+		FossilConfig.Crust.Material,
+		reveal.CrustShards
+	)
+end
+
+-- Step 2: the server confirmed the reveal and named the fossil.
+function FossilController.confirmReveal(index: number, defId: string)
+	local current = pending
+	if current == nil or current.Index ~= index then
+		-- The server uncovered a fossil we were not expecting. Play the whole
+		-- moment now, from the top.
+		local part = PlotController.getFossilPart(index)
+		if part == nil or displays[part] then
+			return
+		end
+		if current then
+			abandonPending()
+		end
+		FossilController.beginReveal(index, part)
+		current = pending
+	end
+	if current == nil then
+		return
+	end
+	current.DefId = defId
+
+	local def = FossilConfig.ById[defId]
+	local feel = def and reveal.ByRarity[def.Rarity]
+	if feel and feel.ExtraSlow > 0 then
+		TimeScale.extend(feel.ExtraSlow)
+	end
+end
+
+-- The server did not agree that the fossil is uncovered yet.
+function FossilController.cancelReveal(index: number)
+	local current = pending
+	if current and current.Index == index and current.DefId == nil then
+		abandonPending()
+	end
+end
+
+function FossilController.Start()
+	PlotController.FossilAdded:Connect(onFossilAdded)
+	PlotController.FossilRemoved:Connect(onFossilRemoved)
+	RunService.RenderStepped:Connect(step)
+end
+
+return FossilController
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="43">
+            <Properties>
+              <string name="Name">HudController</string>
+              <string name="Source"><![CDATA[--!strict
+--[[
+	HudController: the placeholder heads-up display for Milestone 1.
+
+	  * "Fossils 2 / 5": how many of this plot's fossils have been uncovered
+	  * a countdown once the plot is complete and about to refill
+
+	The proper interface (money, inventory, upgrades, pop-in tweens) arrives in
+	Milestone 5. This already follows the UI rules in Ui.luau so it scales on
+	phones.
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+
+local GridConfig = require(ReplicatedStorage.Shared.Config.GridConfig)
+
+local Client = script.Parent.Parent
+local EffectsController = require(script.Parent.EffectsController)
+local PlotController = require(script.Parent.PlotController)
+local Ui = require(Client.Ui.Ui)
+
+local HudController = {}
+
+local counterLabel: TextLabel? = nil
+local statusLabel: TextLabel? = nil
+
+local function numberAttribute(instance: Instance, name: string): number
+	local value = instance:GetAttribute(name)
+	return if typeof(value) == "number" then value else 0
+end
+
+local function build()
+	local hud = Ui.getHud()
+
+	local counter = Ui.create("TextLabel", {
+		Name = "Counter",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Text = "",
+		TextScaled = true,
+		Font = Enum.Font.GothamBold,
+		TextColor3 = Color3.fromRGB(250, 246, 235),
+	}) :: TextLabel
+	counterLabel = counter
+
+	local panel = Ui.create("Frame", {
+		Name = "FossilCounter",
+		AnchorPoint = Vector2.new(0.5, 0),
+		Position = UDim2.fromScale(0.5, 0.02),
+		Size = UDim2.fromScale(0.34, 0.07),
+		BackgroundColor3 = Color3.fromRGB(46, 46, 52),
+		BackgroundTransparency = 0.25,
+		BorderSizePixel = 0,
+	}, {
+		Ui.create("UIAspectRatioConstraint", {
+			AspectRatio = 4.6,
+			AspectType = Enum.AspectType.FitWithinMaxSize,
+			DominantAxis = Enum.DominantAxis.Height,
+		}),
+		Ui.create("UISizeConstraint", { MaxSize = Vector2.new(260, 56) }),
+		Ui.create("UICorner", { CornerRadius = UDim.new(0.3, 0) }),
+		Ui.create("UIPadding", {
+			PaddingTop = UDim.new(0.16, 0),
+			PaddingBottom = UDim.new(0.16, 0),
+			PaddingLeft = UDim.new(0.06, 0),
+			PaddingRight = UDim.new(0.06, 0),
+		}),
+		counter,
+	}) :: Frame
+	panel.Parent = hud
+
+	local status = Ui.create("TextLabel", {
+		Name = "Status",
+		AnchorPoint = Vector2.new(0.5, 0),
+		Position = UDim2.fromScale(0.5, 0.11),
+		Size = UDim2.fromScale(0.7, 0.06),
+		BackgroundTransparency = 1,
+		Text = "",
+		TextScaled = true,
+		Font = Enum.Font.GothamBold,
+		TextColor3 = Color3.fromRGB(255, 225, 120),
+		TextStrokeTransparency = 0.4,
+		Visible = false,
+	}, {
+		Ui.create("UIAspectRatioConstraint", {
+			AspectRatio = 12,
+			AspectType = Enum.AspectType.FitWithinMaxSize,
+			DominantAxis = Enum.DominantAxis.Height,
+		}),
+		Ui.create("UISizeConstraint", { MaxSize = Vector2.new(560, 46) }),
+	}) :: TextLabel
+	status.Parent = hud
+	statusLabel = status
+end
+
+local function refresh()
+	local plot = PlotController.getPlot()
+	local counter = counterLabel
+	local status = statusLabel
+	if plot == nil or counter == nil or status == nil then
+		return
+	end
+
+	local found = numberAttribute(plot, "FossilsFound")
+	local total = numberAttribute(plot, "FossilsTotal")
+	counter.Text = `Fossils {found} / {total}`
+
+	local refillAt = numberAttribute(plot, "RefillAt")
+	local remaining = refillAt - Workspace:GetServerTimeNow()
+	if refillAt > 0 and remaining > 0 then
+		status.Text = `All found! New dig site in {math.ceil(remaining)}...`
+		status.Visible = true
+	else
+		status.Visible = false
+	end
+end
+
+local function onPlotReady(plot: Model)
+	plot:GetAttributeChangedSignal("FossilsFound"):Connect(refresh)
+	plot:GetAttributeChangedSignal("FossilsTotal"):Connect(refresh)
+	plot:GetAttributeChangedSignal("RefillAt"):Connect(refresh)
+	refresh()
+end
+
+local function onRegenerated()
+	local origin = PlotController.getOrigin()
+	if origin then
+		local depth = GridConfig.Layers * GridConfig.CellSize.Y
+		EffectsController.plotRefilled(origin - Vector3.new(0, depth / 2, 0))
+	end
+	refresh()
+end
+
+function HudController.Start()
+	build()
+	PlotController.Ready:Connect(onPlotReady)
+	PlotController.Regenerated:Connect(onRegenerated)
+
+	-- Keeps the refill countdown ticking.
+	task.spawn(function()
+		while true do
+			task.wait(0.25)
+			refresh()
+		end
+	end)
+end
+
+return HudController
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="44">
+            <Properties>
+              <string name="Name">PlotController</string>
+              <string name="Source"><![CDATA[--!strict
+--[[
+	PlotController: this player's view of their own dig plot.
+
+	The server builds the plot and tells us its name (the "PlotName" attribute
+	on the player). This controller finds it, keeps a lookup of the cell and
+	fossil parts that currently exist, and answers "what did that click hit?".
+
+	It also remembers which cells this client has predicted as broken, so the
+	"is this cell exposed?" check matches what the player sees on screen.
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+
+local Shared = ReplicatedStorage.Shared
+local DigRules = require(Shared.Dig.DigRules)
+local Signal = require(Shared.Util.Signal)
+
+export type Target = {
+	Kind: "Cell" | "Fossil",
+	Part: BasePart,
+	Index: number, -- cell index; a fossil uses the index of the cell it sits in
+	Position: Vector3, -- where the click ray hit
+	Normal: Vector3, -- which way that surface faces
+}
+
+local PlotController = {}
+
+PlotController.Ready = Signal.new() -- (plot: Model)
+PlotController.Regenerated = Signal.new() -- ()  the plot was refilled and reseeded
+PlotController.CellRemoved = Signal.new() -- (index: number, part: BasePart)
+PlotController.FossilAdded = Signal.new() -- (index: number, part: BasePart)
+PlotController.FossilRemoved = Signal.new() -- (index: number, part: BasePart)
+
+local player = Players.LocalPlayer
+
+local plotModel: Model? = nil
+local pitOrigin: Vector3? = nil
+local cellsFolder: Instance? = nil
+local fossilsFolder: Instance? = nil
+local cellParts: { [number]: BasePart } = {}
+local fossilParts: { [number]: BasePart } = {}
+local locallyBroken: { [number]: boolean } = {}
+local raycastParams = RaycastParams.new()
+
+local function onCellAdded(child: Instance)
+	local index = tonumber(child.Name)
+	if index and child:IsA("BasePart") then
+		cellParts[index] = child
+		locallyBroken[index] = nil
+	end
+end
+
+local function onCellRemoved(child: Instance)
+	local index = tonumber(child.Name)
+	if index and cellParts[index] == child then
+		cellParts[index] = nil
+		locallyBroken[index] = nil
+		PlotController.CellRemoved:Fire(index, child)
+	end
+end
+
+local function onFossilAdded(child: Instance)
+	local index = tonumber(child.Name)
+	if index and child:IsA("BasePart") then
+		fossilParts[index] = child
+		PlotController.FossilAdded:Fire(index, child)
+	end
+end
+
+local function onFossilRemoved(child: Instance)
+	local index = tonumber(child.Name)
+	if index and fossilParts[index] == child then
+		fossilParts[index] = nil
+		PlotController.FossilRemoved:Fire(index, child)
+	end
+end
+
+local function waitForPlotName(): string
+	while true do
+		local name = player:GetAttribute("PlotName")
+		if typeof(name) == "string" then
+			return name
+		end
+		player:GetAttributeChangedSignal("PlotName"):Wait()
+	end
+end
+
+local function bind()
+	local site = Workspace:WaitForChild("DigSite")
+	local model = site:WaitForChild(waitForPlotName())
+	local cells = model:WaitForChild("Cells")
+	local fossils = model:WaitForChild("Fossils")
+	if not model:IsA("Model") then
+		return
+	end
+
+	local origin = model:GetAttribute("Origin")
+	pitOrigin = if typeof(origin) == "Vector3" then origin else model:GetPivot().Position
+	cellsFolder = cells
+	fossilsFolder = fossils
+
+	-- Clicks only ever test this plot, so other players and the character
+	-- itself never block a swing.
+	raycastParams.FilterType = Enum.RaycastFilterType.Include
+	raycastParams.FilterDescendantsInstances = { model }
+
+	cells.ChildAdded:Connect(onCellAdded)
+	cells.ChildRemoved:Connect(onCellRemoved)
+	fossils.ChildAdded:Connect(onFossilAdded)
+	fossils.ChildRemoved:Connect(onFossilRemoved)
+	for _, child in cells:GetChildren() do
+		onCellAdded(child)
+	end
+	for _, child in fossils:GetChildren() do
+		onFossilAdded(child)
+	end
+
+	model:GetAttributeChangedSignal("Generation"):Connect(function()
+		PlotController.Regenerated:Fire()
+	end)
+
+	plotModel = model
+	PlotController.Ready:Fire(model)
+end
+
+-- Public API ---------------------------------------------------------------
+
+-- The plot model, or nil until the server has assigned one.
+function PlotController.getPlot(): Model?
+	return plotModel
+end
+
+-- Centre of the pit's top surface.
+function PlotController.getOrigin(): Vector3?
+	return pitOrigin
+end
+
+function PlotController.getCellCenter(index: number): Vector3?
+	local origin = pitOrigin
+	if origin == nil then
+		return nil
+	end
+	return DigRules.cellCenter(origin, index)
+end
+
+function PlotController.getFossilPart(index: number): BasePart?
+	return fossilParts[index]
+end
+
+-- A cell is solid while its part exists and we have not predicted it broken.
+function PlotController.isSolid(index: number): boolean
+	return cellParts[index] ~= nil and not locallyBroken[index]
+end
+
+function PlotController.isExposed(index: number): boolean
+	return DigRules.isExposed(index, PlotController.isSolid)
+end
+
+function PlotController.setLocallyBroken(index: number, broken: boolean)
+	locallyBroken[index] = if broken then true else nil
+end
+
+-- What a ray hits in this plot: a cell, a fossil, or nothing diggable.
+function PlotController.raycast(origin: Vector3, direction: Vector3): Target?
+	if plotModel == nil then
+		return nil
+	end
+	local result = Workspace:Raycast(origin, direction, raycastParams)
+	if result == nil then
+		return nil
+	end
+	local hit = result.Instance
+	local index = tonumber(hit.Name)
+	if index == nil then
+		return nil
+	end
+	local kind: "Cell" | "Fossil"
+	if hit.Parent == cellsFolder then
+		kind = "Cell"
+	elseif hit.Parent == fossilsFolder then
+		kind = "Fossil"
+	else
+		return nil
+	end
+	return {
+		Kind = kind,
+		Part = hit,
+		Index = index,
+		Position = result.Position,
+		Normal = result.Normal,
+	}
+end
+
+function PlotController.Start()
+	task.spawn(bind)
+end
+
+return PlotController
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="45">
+            <Properties>
+              <string name="Name">ToolController</string>
+              <string name="Source"><![CDATA[--!strict
+--[[
+	ToolController: which tool this player is holding, and the buttons to
+	switch between them.
+
+	Switching feels instant: the button and the dig prediction change at once,
+	and the request goes to the server, which does the real equipping (see
+	ToolService). The server stays the authority on what a swing does.
+
+	Controls: tap a tool button, press its number key (1, 2), or press Q to
+	swap to the next tool.
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local StarterGui = game:GetService("StarterGui")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+
+local Shared = ReplicatedStorage.Shared
+local Remotes = require(Shared.Remotes)
+local Signal = require(Shared.Util.Signal)
+local ToolConfig = require(Shared.Config.ToolConfig)
+
+local Client = script.Parent.Parent
+local SoundPlayer = require(Client.Effects.SoundPlayer)
+local Ui = require(Client.Ui.Ui)
+
+local SLOT_KEYS = {
+	Enum.KeyCode.One,
+	Enum.KeyCode.Two,
+	Enum.KeyCode.Three,
+	Enum.KeyCode.Four,
+}
+local NEXT_TOOL_KEY = Enum.KeyCode.Q
+
+local SELECTED_COLOR = Color3.fromRGB(250, 246, 235)
+local IDLE_COLOR = Color3.fromRGB(46, 46, 52)
+local SELECTED_STROKE = Color3.fromRGB(255, 205, 70)
+local IDLE_STROKE = Color3.fromRGB(20, 20, 24)
+local WOOD = Color3.fromRGB(150, 104, 62)
+
+type ToolButton = {
+	Button: TextButton,
+	Stroke: UIStroke,
+	Scale: UIScale,
+	Label: TextLabel,
+}
+
+local ToolController = {}
+
+ToolController.Changed = Signal.new() -- (toolId: string)
+
+local player = Players.LocalPlayer
+local equipped: string = ToolConfig.DefaultTool
+local toolIds: { string } = {} -- in hotbar order
+local buttons: { [string]: ToolButton } = {}
+local popInfo = TweenInfo.new(0.18, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+local nudgeInfo = TweenInfo.new(0.45, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+
+-- Greybox pictograms made of plain frames, so no image assets are needed.
+local function bar(position: UDim2, size: UDim2, rotation: number, color: Color3): Frame
+	return Ui.create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = position,
+		Size = size,
+		Rotation = rotation,
+		BackgroundColor3 = color,
+		BorderSizePixel = 0,
+	}, {
+		Ui.create("UICorner", { CornerRadius = UDim.new(0.3, 0) }),
+	})
+end
+
+local function buildIcon(toolId: string): { Instance }
+	if toolId == "Pickaxe" then
+		return {
+			bar(UDim2.fromScale(0.46, 0.58), UDim2.fromScale(0.13, 0.78), 45, WOOD),
+			bar(
+				UDim2.fromScale(0.72, 0.31),
+				UDim2.fromScale(0.14, 0.7),
+				-45,
+				Color3.fromRGB(110, 116, 128)
+			),
+		}
+	elseif toolId == "Brush" then
+		return {
+			bar(UDim2.fromScale(0.4, 0.64), UDim2.fromScale(0.14, 0.56), 45, WOOD),
+			bar(
+				UDim2.fromScale(0.68, 0.36),
+				UDim2.fromScale(0.34, 0.36),
+				45,
+				Color3.fromRGB(236, 214, 150)
+			),
+		}
+	end
+	return {}
+end
+
+local function refresh()
+	for toolId, entry in buttons do
+		local selected = toolId == equipped
+		entry.Button.BackgroundColor3 = if selected then SELECTED_COLOR else IDLE_COLOR
+		entry.Button.BackgroundTransparency = if selected then 0 else 0.25
+		entry.Stroke.Color = if selected then SELECTED_STROKE else IDLE_STROKE
+		entry.Label.TextColor3 = if selected then IDLE_COLOR else SELECTED_COLOR
+		TweenService:Create(entry.Scale, popInfo, { Scale = if selected then 1.08 else 0.94 })
+			:Play()
+	end
+end
+
+local function buildToolBar()
+	local count = #toolIds
+	local toolBar = Ui.create("Frame", {
+		Name = "ToolBar",
+		-- Bottom centre: clear of the thumbstick (bottom left) and the jump
+		-- button (bottom right) on phones.
+		AnchorPoint = Vector2.new(0.5, 1),
+		Position = UDim2.fromScale(0.5, 0.97),
+		Size = UDim2.fromScale(0.5, 0.17),
+		BackgroundTransparency = 1,
+	}, {
+		Ui.create("UIAspectRatioConstraint", {
+			AspectRatio = count * 1.1,
+			AspectType = Enum.AspectType.FitWithinMaxSize,
+			DominantAxis = Enum.DominantAxis.Height,
+		}),
+		-- Stops the buttons becoming huge on desktop monitors.
+		Ui.create("UISizeConstraint", { MaxSize = Vector2.new(count * 116, 106) }),
+		Ui.create("UIListLayout", {
+			FillDirection = Enum.FillDirection.Horizontal,
+			HorizontalAlignment = Enum.HorizontalAlignment.Center,
+			VerticalAlignment = Enum.VerticalAlignment.Center,
+			SortOrder = Enum.SortOrder.LayoutOrder,
+			Padding = UDim.new(0.06 / count, 0),
+		}),
+	}) :: Frame
+
+	for slot, toolId in toolIds do
+		local def = ToolConfig.Tools[toolId]
+		local stroke = Ui.create("UIStroke", {
+			Thickness = 3,
+			ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		}) :: UIStroke
+		local scale = Ui.create("UIScale", { Scale = 1 }) :: UIScale
+		local label = Ui.create("TextLabel", {
+			Name = "ToolName",
+			AnchorPoint = Vector2.new(0.5, 1),
+			Position = UDim2.fromScale(0.5, 0.96),
+			Size = UDim2.fromScale(0.9, 0.24),
+			BackgroundTransparency = 1,
+			Text = def.DisplayName,
+			TextScaled = true,
+			Font = Enum.Font.GothamBold,
+		}) :: TextLabel
+		local icon = Ui.create("Frame", {
+			Name = "Icon",
+			AnchorPoint = Vector2.new(0.5, 0),
+			Position = UDim2.fromScale(0.5, 0.06),
+			Size = UDim2.fromScale(0.66, 0.66),
+			BackgroundTransparency = 1,
+		}, buildIcon(toolId)) :: Frame
+
+		local children: { Instance } = {
+			Ui.create("UIAspectRatioConstraint", { AspectRatio = 1 }),
+			Ui.create("UICorner", { CornerRadius = UDim.new(0.18, 0) }),
+			stroke,
+			scale,
+			icon,
+			label,
+		}
+		-- Number-key hint, only where there is a keyboard.
+		if UserInputService.KeyboardEnabled then
+			table.insert(
+				children,
+				Ui.create("TextLabel", {
+					Name = "Key",
+					Position = UDim2.fromScale(0.07, 0.05),
+					Size = UDim2.fromScale(0.2, 0.2),
+					BackgroundTransparency = 1,
+					Text = tostring(slot),
+					TextScaled = true,
+					Font = Enum.Font.GothamBold,
+					TextColor3 = Color3.fromRGB(150, 150, 150),
+				})
+			)
+		end
+
+		local button = Ui.create("TextButton", {
+			Name = toolId,
+			LayoutOrder = slot,
+			Size = UDim2.fromScale(0.94 / count, 1),
+			Text = "",
+			AutoButtonColor = false,
+			BorderSizePixel = 0,
+		}, children) :: TextButton
+		button.Activated:Connect(function()
+			ToolController.equip(toolId)
+		end)
+		button.Parent = toolBar
+
+		buttons[toolId] = { Button = button, Stroke = stroke, Scale = scale, Label = label }
+	end
+
+	toolBar.Parent = Ui.getHud()
+	refresh()
+end
+
+-- Our own buttons replace Roblox's default tool hotbar.
+local function hideDefaultHotbar()
+	task.spawn(function()
+		for _ = 1, 20 do
+			local ok = pcall(function()
+				StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack, false)
+			end)
+			if ok then
+				return
+			end
+			task.wait(0.5)
+		end
+	end)
+end
+
+local function onInputBegan(input: InputObject, processedByUi: boolean)
+	if processedByUi or input.UserInputType ~= Enum.UserInputType.Keyboard then
+		return
+	end
+	if input.KeyCode == NEXT_TOOL_KEY then
+		local current = table.find(toolIds, equipped) or 1
+		ToolController.equip(toolIds[current % #toolIds + 1])
+		return
+	end
+	local slot = table.find(SLOT_KEYS, input.KeyCode)
+	if slot and toolIds[slot] then
+		ToolController.equip(toolIds[slot])
+	end
+end
+
+-- Public API ---------------------------------------------------------------
+
+-- The tool this player has chosen. Used to predict what a swing will do.
+function ToolController.getEquipped(): string
+	return equipped
+end
+
+function ToolController.equip(toolId: string)
+	if toolId == equipped or ToolConfig.Tools[toolId] == nil then
+		return
+	end
+	equipped = toolId
+	Remotes.get("EquipRequest"):FireServer(toolId)
+	SoundPlayer.play("ToolSwitch")
+	refresh()
+	ToolController.Changed:Fire(toolId)
+end
+
+-- Pulses a tool's button to suggest switching to it. Used when the tool in
+-- hand cannot affect what was hit, so players learn the tools without text.
+function ToolController.nudge(toolId: string)
+	local entry = buttons[toolId]
+	if entry == nil or toolId == equipped then
+		return
+	end
+	entry.Scale.Scale = 1.3
+	entry.Stroke.Color = SELECTED_STROKE
+	TweenService:Create(entry.Scale, nudgeInfo, { Scale = 0.94 }):Play()
+	TweenService:Create(entry.Stroke, nudgeInfo, { Color = IDLE_STROKE }):Play()
+end
+
+-- Plays Roblox's built-in tool swing on the character. The default Animate
+-- script watches the held Tool for a StringValue named "toolanim".
+function ToolController.playSwing()
+	local character = player.Character
+	local tool = character and character:FindFirstChildOfClass("Tool")
+	if tool then
+		local request = Instance.new("StringValue")
+		request.Name = "toolanim"
+		request.Value = "Slash"
+		request.Parent = tool
+	end
+end
+
+function ToolController.Init()
+	for toolId in ToolConfig.Tools do
+		table.insert(toolIds, toolId)
+	end
+	table.sort(toolIds, function(a: string, b: string): boolean
+		return ToolConfig.Tools[a].Slot < ToolConfig.Tools[b].Slot
+	end)
+
+	local fromServer = player:GetAttribute("EquippedTool")
+	if typeof(fromServer) == "string" and ToolConfig.Tools[fromServer] then
+		equipped = fromServer
+	end
+end
+
+function ToolController.Start()
+	hideDefaultHotbar()
+	buildToolBar()
+	UserInputService.InputBegan:Connect(onInputBegan)
+end
+
+return ToolController
+]]></string>
+            </Properties>
+          </Item>
+        </Item>
+        <Item class="Folder" referent="46">
+          <Properties>
+            <string name="Name">Effects</string>
+          </Properties>
+          <Item class="ModuleScript" referent="47">
+            <Properties>
+              <string name="Name">CameraFx</string>
+              <string name="Source"><![CDATA[--!strict
+--[[
+	CameraFx: camera shake and field-of-view kicks.
+
+	Both are applied after Roblox's own camera has updated for the frame, on
+	top of wherever it put the camera, so they never fight the player's camera
+	control and never build up over time.
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+
+local FeelConfig = require(ReplicatedStorage.Shared.Config.FeelConfig)
+
+local CameraFx = {}
+
+-- Shake strength, 0-1. It fades by itself.
+local trauma = 0
+
+-- Field of view: a temporary offset added to the camera's own value.
+local fovBase: number? = nil
+local fovOffset = 0
+local fovFrom = 0
+local fovTo = 0
+local fovStart = 0
+local fovDuration = 0.1
+
+-- Adds camera shake. 0.2 is a light tap, 0.6 is a heavy thud. Capped at 1.
+function CameraFx.shake(amount: number)
+	if FeelConfig.CameraShake.Enabled and amount > 0 then
+		trauma = math.min(1, trauma + amount)
+	end
+end
+
+-- Moves the field-of-view offset to `target` degrees over `duration` seconds.
+-- Negative zooms in. Go back to 0 to release the camera.
+function CameraFx.setFovOffset(target: number, duration: number)
+	fovFrom = fovOffset
+	fovTo = target
+	fovStart = os.clock()
+	fovDuration = math.max(duration, 0.01)
+end
+
+local function step(delta: number)
+	local camera = Workspace.CurrentCamera
+	if camera == nil then
+		return
+	end
+
+	if fovOffset ~= 0 or fovTo ~= 0 then
+		local base = fovBase or camera.FieldOfView
+		fovBase = base
+		local alpha = math.clamp((os.clock() - fovStart) / fovDuration, 0, 1)
+		local eased = 1 - (1 - alpha) * (1 - alpha)
+		fovOffset = fovFrom + (fovTo - fovFrom) * eased
+		camera.FieldOfView = base + fovOffset
+		if alpha >= 1 and fovTo == 0 then
+			fovOffset = 0
+			fovBase = nil
+		end
+	end
+
+	if trauma > 0 then
+		local settings = FeelConfig.CameraShake
+		local strength = trauma * trauma
+		local time = os.clock() * settings.Frequency
+		-- math.noise gives smooth values around -0.5..0.5; doubled to about -1..1.
+		local offsetX = math.noise(time, 0.5) * 2 * settings.MaxOffset * strength
+		local offsetY = math.noise(time, 17.5) * 2 * settings.MaxOffset * strength
+		local roll = math.rad(math.noise(time, 43.5) * 2 * settings.MaxRoll * strength)
+		camera.CFrame = camera.CFrame * CFrame.new(offsetX, offsetY, 0) * CFrame.Angles(0, 0, roll)
+		trauma = math.max(0, trauma - settings.Decay * delta)
+	end
+end
+
+function CameraFx.start()
+	RunService:BindToRenderStep("DigCameraFx", Enum.RenderPriority.Camera.Value + 1, step)
+end
+
+return CameraFx
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="48">
+            <Properties>
+              <string name="Name">CellVisuals</string>
+              <string name="Source"><![CDATA[--!strict
+--[[
+	CellVisuals: how grid cells and fossil crusts LOOK on this client.
+
+	The server owns the parts; this module only changes how they appear to
+	this player, to give instant feedback:
+	  * a cell shrinks, darkens and tilts as it takes damage
+	  * a cell or crust is knocked back for an instant when hit ("punch")
+	  * a cell shakes sideways when the wrong tool hits it ("wiggle")
+	  * a cell is hidden the moment we predict it breaks
+
+	None of this is sent to the server, and all of it is undone if the server
+	disagrees with the prediction.
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Shared = ReplicatedStorage.Shared
+local FeelConfig = require(Shared.Config.FeelConfig)
+local FossilConfig = require(Shared.Config.FossilConfig)
+
+type ChildRecord = {
+	Part: BasePart,
+	Relative: CFrame, -- the child's position relative to its cell (cracks ride along)
+	Transparency: number,
+}
+
+type Record = {
+	Part: BasePart,
+	BaseCFrame: CFrame,
+	BaseSize: Vector3,
+	BaseColor: Color3,
+	BaseTransparency: number,
+	BaseCanCollide: boolean,
+	Children: { ChildRecord },
+	-- Resting look.
+	Tilt: CFrame,
+	Scale: number,
+	ScaleHeight: boolean, -- crusts shrink in every direction; cells keep their height
+	-- A reaction that is fading out. ReactTime 0 means none.
+	ReactAge: number,
+	ReactTime: number,
+	ReactSquash: number,
+	ReactDrop: number,
+	ReactWiggle: number,
+	Hidden: boolean,
+}
+
+local WIGGLE_SPEED = 60 -- radians per second
+
+local CellVisuals = {}
+
+local records: { [BasePart]: Record } = {}
+local reacting: { [BasePart]: Record } = {}
+local random = Random.new()
+
+local function getRecord(part: BasePart): Record
+	local existing = records[part]
+	if existing then
+		return existing
+	end
+	local children: { ChildRecord } = {}
+	for _, child in part:GetChildren() do
+		if child:IsA("BasePart") then
+			table.insert(children, {
+				Part = child,
+				Relative = part.CFrame:ToObjectSpace(child.CFrame),
+				Transparency = child.Transparency,
+			})
+		end
+	end
+	local record: Record = {
+		Part = part,
+		BaseCFrame = part.CFrame,
+		BaseSize = part.Size,
+		BaseColor = part.Color,
+		BaseTransparency = part.Transparency,
+		BaseCanCollide = part.CanCollide,
+		Children = children,
+		Tilt = CFrame.new(),
+		Scale = 1,
+		ScaleHeight = false,
+		ReactAge = 0,
+		ReactTime = 0,
+		ReactSquash = 0,
+		ReactDrop = 0,
+		ReactWiggle = 0,
+		Hidden = false,
+	}
+	records[part] = record
+	return record
+end
+
+-- Places the part for its resting look plus whatever is left of a reaction.
+local function apply(record: Record)
+	local strength = 0 -- 1 at the instant of a hit, fading to 0
+	if record.ReactTime > 0 then
+		local progress = math.clamp(record.ReactAge / record.ReactTime, 0, 1)
+		strength = (1 - progress) * (1 - progress)
+	end
+
+	local scale = record.Scale * (1 - record.ReactSquash * strength)
+	local base = record.BaseSize
+	local height = if record.ScaleHeight then base.Y * scale else base.Y
+	local offset = Vector3.new(
+		math.sin(record.ReactAge * WIGGLE_SPEED) * record.ReactWiggle * strength,
+		-record.ReactDrop * strength,
+		0
+	)
+	local cframe = record.BaseCFrame * record.Tilt + offset
+
+	local part = record.Part
+	part.Size = Vector3.new(base.X * scale, height, base.Z * scale)
+	part.CFrame = cframe
+	for _, child in record.Children do
+		child.Part.CFrame = cframe * child.Relative
+	end
+end
+
+local function react(part: BasePart, squash: number, drop: number, wiggle: number, time: number)
+	local record = getRecord(part)
+	record.ReactAge = 0
+	record.ReactTime = math.max(time, 0.01)
+	record.ReactSquash = squash
+	record.ReactDrop = drop
+	record.ReactWiggle = wiggle
+	reacting[part] = record
+	apply(record)
+end
+
+-- Shows how damaged a cell is. 0 = untouched, 1 = about to break.
+function CellVisuals.setCellDamage(part: BasePart, fraction: number)
+	local hit = FeelConfig.CellHit
+	local amount = math.clamp(fraction, 0, 1)
+	local record = getRecord(part)
+	local maxTilt = math.rad(hit.DamageTilt) * amount
+	record.Scale = 1 - hit.DamageShrink * amount
+	record.Tilt =
+		CFrame.Angles(random:NextNumber(-maxTilt, maxTilt), 0, random:NextNumber(-maxTilt, maxTilt))
+	part.Color = record.BaseColor:Lerp(Color3.new(0, 0, 0), hit.DamageDarken * amount)
+	apply(record)
+end
+
+-- Shows how clean a fossil's crust is. 0 = just exposed, 1 = fully brushed.
+function CellVisuals.setCrustClean(part: BasePart, fraction: number)
+	local crust = FossilConfig.Crust
+	local amount = math.clamp(fraction, 0, 1)
+	local record = getRecord(part)
+	record.ScaleHeight = true
+	record.Scale = 1 - FeelConfig.Crust.ShrinkWhenClean * amount
+	part.Color = crust.DirtyColor:Lerp(crust.CleanColor, amount)
+	apply(record)
+end
+
+-- A hit landed: knock the part back for an instant.
+function CellVisuals.punch(part: BasePart)
+	local hit = FeelConfig.CellHit
+	react(part, hit.PunchSquash, hit.PunchDrop, 0, hit.PunchTime)
+end
+
+-- Shake the part sideways (wrong tool, brush strokes).
+function CellVisuals.wiggle(part: BasePart, amount: number, time: number)
+	react(part, 0, 0, amount, time)
+end
+
+-- Hide a cell we predict has broken. It stays in place until the server
+-- removes it, but can no longer be seen, stood on or clicked.
+function CellVisuals.hide(part: BasePart)
+	local record = getRecord(part)
+	if record.Hidden then
+		return
+	end
+	record.Hidden = true
+	part.Transparency = 1
+	part.CanCollide = false
+	part.CanQuery = false
+	for _, child in record.Children do
+		child.Part.Transparency = 1
+	end
+end
+
+-- Undo hide(): the server said the cell is still there.
+function CellVisuals.show(part: BasePart)
+	local record = records[part]
+	if record == nil or not record.Hidden then
+		return
+	end
+	record.Hidden = false
+	part.Transparency = record.BaseTransparency
+	part.CanCollide = record.BaseCanCollide
+	part.CanQuery = true
+	for _, child in record.Children do
+		child.Part.Transparency = child.Transparency
+	end
+end
+
+-- End any punch or wiggle now and leave the part at rest. After this,
+-- nothing here writes to the part again until the next hit.
+function CellVisuals.stopReaction(part: BasePart)
+	local record = reacting[part]
+	if record then
+		reacting[part] = nil
+		record.ReactTime = 0
+		apply(record)
+	end
+end
+
+-- Stop tracking a part (it was removed, or something else now animates it).
+function CellVisuals.forget(part: BasePart)
+	records[part] = nil
+	reacting[part] = nil
+end
+
+-- Call once per frame with the (time-scaled) frame time.
+function CellVisuals.step(delta: number)
+	for part, record in reacting do
+		record.ReactAge += delta
+		if record.ReactAge >= record.ReactTime then
+			record.ReactTime = 0
+			reacting[part] = nil
+		end
+		apply(record)
+	end
+end
+
+return CellVisuals
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="49">
+            <Properties>
+              <string name="Name">DebrisField</string>
+              <string name="Source"><![CDATA[--!strict
+--[[
+	DebrisField: the crumble. Small greybox pieces that fly out of a
+	breaking cell, tumble, shrink and vanish.
+
+	The pieces are moved by this script, not by physics: that keeps them
+	cheap, lets them be pooled, and lets slow motion affect them.
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local EffectsRoot = require(script.Parent.EffectsRoot)
+local FeelConfig = require(ReplicatedStorage.Shared.Config.FeelConfig)
+
+type Piece = {
+	Part: Part,
+	Active: boolean,
+	Position: Vector3,
+	Velocity: Vector3,
+	Axis: Vector3,
+	Angle: number,
+	Spin: number,
+	Size: number,
+	Age: number,
+	Lifetime: number,
+}
+
+local DebrisField = {}
+
+local pieces: { Piece } = {}
+local nextReuse = 1
+local random = Random.new()
+
+local function newPiece(): Piece
+	local part = Instance.new("Part")
+	part.Name = "Debris"
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanQuery = false
+	part.CanTouch = false
+	part.CastShadow = false
+	part.TopSurface = Enum.SurfaceType.Smooth
+	part.BottomSurface = Enum.SurfaceType.Smooth
+	part.Transparency = 1
+	part.Parent = EffectsRoot.Folder
+	return {
+		Part = part,
+		Active = false,
+		Position = Vector3.zero,
+		Velocity = Vector3.zero,
+		Axis = Vector3.yAxis,
+		Angle = 0,
+		Spin = 0,
+		Size = 1,
+		Age = 0,
+		Lifetime = 1,
+	}
+end
+
+local function takePiece(): Piece
+	for _, piece in pieces do
+		if not piece.Active then
+			return piece
+		end
+	end
+	if #pieces < FeelConfig.Crumble.MaxPieces then
+		local piece = newPiece()
+		table.insert(pieces, piece)
+		return piece
+	end
+	-- Everything is in the air: reuse the next one in line.
+	local piece = pieces[nextReuse]
+	nextReuse = nextReuse % #pieces + 1
+	return piece
+end
+
+-- Throws `count` pieces out of a box centred on `center`.
+function DebrisField.burst(
+	center: Vector3,
+	boxSize: Vector3,
+	color: Color3,
+	material: Enum.Material,
+	count: number
+)
+	local crumble = FeelConfig.Crumble
+	for _ = 1, count do
+		local piece = takePiece()
+		local angle = random:NextNumber(0, math.pi * 2)
+		local speed = random:NextNumber(crumble.SpeedMin, crumble.SpeedMax)
+
+		piece.Active = true
+		piece.Age = 0
+		piece.Lifetime = crumble.Lifetime * random:NextNumber(0.7, 1.1)
+		piece.Size = random:NextNumber(crumble.SizeMin, crumble.SizeMax)
+		piece.Position = center
+			+ Vector3.new(
+				random:NextNumber(-0.4, 0.4) * boxSize.X,
+				random:NextNumber(-0.4, 0.4) * boxSize.Y,
+				random:NextNumber(-0.4, 0.4) * boxSize.Z
+			)
+		piece.Velocity = Vector3.new(
+			math.cos(angle) * speed,
+			crumble.Upward * random:NextNumber(0.5, 1.2),
+			math.sin(angle) * speed
+		)
+		piece.Axis = random:NextUnitVector()
+		piece.Angle = random:NextNumber(0, math.pi * 2)
+		piece.Spin = crumble.Spin * random:NextNumber(0.5, 1.5)
+
+		piece.Part.Color = color
+		piece.Part.Material = material
+		piece.Part.Transparency = 0
+	end
+end
+
+-- Call once per frame with the (time-scaled) frame time.
+function DebrisField.step(delta: number)
+	local gravity = Vector3.new(0, -FeelConfig.Crumble.Gravity, 0)
+	for _, piece in pieces do
+		if piece.Active then
+			piece.Age += delta
+			if piece.Age >= piece.Lifetime then
+				piece.Active = false
+				piece.Part.Transparency = 1
+			else
+				piece.Velocity += gravity * delta
+				piece.Position += piece.Velocity * delta
+				piece.Angle += piece.Spin * delta
+				-- Shrink slowly at first, then quickly at the end.
+				local life = piece.Age / piece.Lifetime
+				local size = math.max(piece.Size * (1 - life * life), 0.05)
+				piece.Part.Size = Vector3.new(size, size, size)
+				piece.Part.CFrame = CFrame.new(piece.Position)
+					* CFrame.fromAxisAngle(piece.Axis, piece.Angle)
+			end
+		end
+	end
+end
+
+return DebrisField
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="50">
+            <Properties>
+              <string name="Name">EffectsRoot</string>
+              <string name="Source"><![CDATA[--!strict
+--[[
+	EffectsRoot: a folder in Workspace that exists only on this client.
+
+	Anything a LocalScript creates in Workspace is seen by this player alone,
+	so crumble pieces, particle anchors and outlines all live here.
+]]
+
+local Workspace = game:GetService("Workspace")
+
+local folder = Instance.new("Folder")
+folder.Name = "LocalEffects"
+folder.Parent = Workspace
+
+-- Particles need a part to live on. This one is invisible and never moves;
+-- each burst uses an Attachment placed wherever the effect should appear.
+local anchor = Instance.new("Part")
+anchor.Name = "Anchor"
+anchor.Anchored = true
+anchor.CanCollide = false
+anchor.CanQuery = false
+anchor.CanTouch = false
+anchor.Transparency = 1
+anchor.Size = Vector3.new(1, 1, 1)
+anchor.CFrame = CFrame.new()
+anchor.Parent = folder
+
+return {
+	Folder = folder,
+	Anchor = anchor,
+}
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="51">
+            <Properties>
+              <string name="Name">ParticlePool</string>
+              <string name="Source"><![CDATA[--!strict
+--[[
+	ParticlePool: one-shot particle bursts from FeelConfig.Particles.
+
+	Each kind of burst keeps a few emitters that are reused in turn, so
+	nothing is created while the player is digging.
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local EffectsRoot = require(script.Parent.EffectsRoot)
+local FeelConfig = require(ReplicatedStorage.Shared.Config.FeelConfig)
+
+local EMITTERS_PER_KIND = 4
+
+type Slot = {
+	Attachment: Attachment,
+	Emitter: ParticleEmitter,
+}
+
+type Pool = {
+	Slots: { Slot },
+	Next: number,
+}
+
+local ParticlePool = {}
+
+local pools: { [string]: Pool } = {}
+local emitters: { ParticleEmitter } = {}
+local timeScale = 1
+
+-- Creates an emitter that looks like FeelConfig.Particles[key]. It does not
+-- emit by itself: call Emit() on it, or set its Rate.
+function ParticlePool.newEmitter(key: string, parent: Instance): ParticleEmitter?
+	local def = FeelConfig.Particles[key]
+	if def == nil then
+		return nil
+	end
+	local emitter = Instance.new("ParticleEmitter")
+	emitter.Name = key
+	emitter.Enabled = false
+	emitter.Rate = 0
+	emitter.Texture = def.Texture
+	emitter.Color = ColorSequence.new(def.Color)
+	emitter.Lifetime = def.Lifetime
+	emitter.Speed = def.Speed
+	emitter.Size = NumberSequence.new(def.SizeStart, def.SizeEnd)
+	emitter.Transparency = NumberSequence.new(def.TransparencyStart, def.TransparencyEnd)
+	emitter.SpreadAngle = Vector2.new(def.SpreadAngle, def.SpreadAngle)
+	emitter.Acceleration = def.Acceleration
+	emitter.Drag = def.Drag
+	emitter.RotSpeed = def.RotSpeed
+	emitter.Rotation = NumberRange.new(0, 360)
+	emitter.LightEmission = def.LightEmission
+	emitter.EmissionDirection = Enum.NormalId.Top
+	emitter.TimeScale = timeScale
+	emitter.Parent = parent
+	table.insert(emitters, emitter)
+	return emitter
+end
+
+local function getPool(key: string): Pool?
+	local pool = pools[key]
+	if pool then
+		return pool
+	end
+	local slots: { Slot } = {}
+	for _ = 1, EMITTERS_PER_KIND do
+		local attachment = Instance.new("Attachment")
+		attachment.Name = key
+		attachment.Parent = EffectsRoot.Anchor
+		local emitter = ParticlePool.newEmitter(key, attachment)
+		if emitter == nil then
+			attachment:Destroy()
+			return nil
+		end
+		table.insert(slots, { Attachment = attachment, Emitter = emitter })
+	end
+	local created: Pool = { Slots = slots, Next = 1 }
+	pools[key] = created
+	return created
+end
+
+-- A frame whose "up" points along the surface normal, so particles spray
+-- away from whatever face was hit.
+local function orient(position: Vector3, normal: Vector3?): CFrame
+	if normal == nil or normal.Y > 0.99 then
+		return CFrame.new(position)
+	end
+	if normal.Y < -0.99 then
+		return CFrame.new(position) * CFrame.Angles(math.pi, 0, 0)
+	end
+	return CFrame.lookAt(position, position + normal) * CFrame.Angles(-math.pi / 2, 0, 0)
+end
+
+-- Bursts particles of this kind at a point in the world.
+--   normal      spray direction (defaults to straight up)
+--   countScale  multiplies the kind's particle count
+--   color       replaces the kind's colour for this and later bursts
+function ParticlePool.emit(
+	key: string,
+	position: Vector3,
+	normal: Vector3?,
+	countScale: number?,
+	color: Color3?
+)
+	local def = FeelConfig.Particles[key]
+	local pool = getPool(key)
+	if def == nil or pool == nil then
+		return
+	end
+	local slot = pool.Slots[pool.Next]
+	pool.Next = pool.Next % #pool.Slots + 1
+
+	slot.Attachment.WorldCFrame = orient(position, normal)
+	if color then
+		slot.Emitter.Color = ColorSequence.new(color)
+	end
+	slot.Emitter:Emit(math.max(1, math.round(def.Count * (countScale or 1))))
+end
+
+-- Speed of every particle made here; 1 is normal. Used for slow motion.
+function ParticlePool.setTimeScale(scale: number)
+	if scale == timeScale then
+		return
+	end
+	timeScale = scale
+	for index = #emitters, 1, -1 do
+		local emitter = emitters[index]
+		if emitter.Parent == nil then
+			table.remove(emitters, index)
+		else
+			emitter.TimeScale = scale
+		end
+	end
+end
+
+return ParticlePool
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="52">
+            <Properties>
+              <string name="Name">SoundPlayer</string>
+              <string name="Source"><![CDATA[--!strict
+--[[
+	SoundPlayer: plays the layered sound effects defined in SoundConfig.
+
+	Sounds are not positional: they are this player's own feedback, so they
+	play at full clarity. A few Sound objects ("voices") are kept per asset and
+	reused, so quick repeated hits can overlap without creating new instances.
+]]
+
+local ContentProvider = game:GetService("ContentProvider")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local SoundService = game:GetService("SoundService")
+
+local SoundConfig = require(ReplicatedStorage.Shared.Config.SoundConfig)
+
+local MAX_VOICES_PER_ASSET = 6
+
+local SoundPlayer = {}
+
+local folder: Folder? = nil
+local voices: { [string]: { Sound } } = {}
+-- Counts plays per voice, so a scheduled cut-off never stops a newer play.
+local playCount: { [Sound]: number } = {}
+local globalPitch = 1
+
+local function getFolder(): Folder
+	local existing = folder
+	if existing then
+		return existing
+	end
+	local created = Instance.new("Folder")
+	created.Name = "DigSounds"
+	created.Parent = SoundService
+	folder = created
+	return created
+end
+
+local function acquire(assetId: string): Sound
+	local list = voices[assetId]
+	if list == nil then
+		list = {}
+		voices[assetId] = list
+	end
+	for _, sound in list do
+		if not sound.IsPlaying then
+			return sound
+		end
+	end
+	if #list < MAX_VOICES_PER_ASSET then
+		local sound = Instance.new("Sound")
+		sound.SoundId = assetId
+		sound.Parent = getFolder()
+		table.insert(list, sound)
+		return sound
+	end
+	-- Every voice is busy: reuse the oldest.
+	local oldest = table.remove(list, 1) :: Sound
+	table.insert(list, oldest)
+	return oldest
+end
+
+local function playLayer(layer: SoundConfig.SoundLayer, pitch: number, volume: number)
+	local sound = acquire(layer.Id)
+	local count = (playCount[sound] or 0) + 1
+	playCount[sound] = count
+
+	sound.Volume = math.clamp(layer.Volume * volume * SoundConfig.MasterVolume, 0, 10)
+	sound.PlaybackSpeed = math.clamp(layer.Pitch * pitch * globalPitch, 0.05, 10)
+	sound.TimePosition = 0
+	sound:Play()
+
+	local length = layer.Length
+	if length then
+		task.delay(length, function()
+			if playCount[sound] == count then
+				sound:Stop()
+			end
+		end)
+	end
+end
+
+-- Plays a sound from SoundConfig.Sounds. pitch and volume scale every layer.
+function SoundPlayer.play(key: string, pitch: number?, volume: number?)
+	local layers = SoundConfig.Sounds[key]
+	if layers == nil then
+		return
+	end
+	for _, layer in layers do
+		local delay = layer.Delay
+		if delay and delay > 0 then
+			task.delay(delay, playLayer, layer, pitch or 1, volume or 1)
+		else
+			playLayer(layer, pitch or 1, volume or 1)
+		end
+	end
+end
+
+-- Pitch applied to every sound that starts from now on (used for slow motion).
+function SoundPlayer.setGlobalPitch(pitch: number)
+	globalPitch = pitch
+end
+
+-- Loads every sound up front, so the first hit is not silent.
+function SoundPlayer.preload()
+	local toLoad: { Instance } = {}
+	for _, layers in SoundConfig.Sounds do
+		for _, layer in layers do
+			if voices[layer.Id] == nil then
+				table.insert(toLoad, acquire(layer.Id))
+			end
+		end
+	end
+	task.spawn(function()
+		pcall(function()
+			ContentProvider:PreloadAsync(toLoad)
+		end)
+	end)
+end
+
+return SoundPlayer
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="53">
+            <Properties>
+              <string name="Name">TimeScale</string>
+              <string name="Source"><![CDATA[--!strict
+--[[
+	TimeScale: the speed at which this player's effects run. 1 is normal.
+
+	Used for the brief slow motion when a fossil is uncovered. It only slows
+	local effects (crumble pieces, particles, cell reactions). The server, other
+	players and the character itself keep running at normal speed.
+]]
+
+local TimeScale = {}
+
+local current = 1
+local slowScale = 1
+local holdUntil = 0
+local recoverTime = 0.2
+
+function TimeScale.get(): number
+	return current
+end
+
+-- Drop to `scale` at once, hold it for `hold` seconds, then ease back to 1.
+function TimeScale.slow(scale: number, hold: number, recover: number)
+	slowScale = math.clamp(scale, 0.01, 1)
+	current = slowScale
+	holdUntil = os.clock() + hold
+	recoverTime = math.max(recover, 0.01)
+end
+
+-- Keep the current slow motion going for `extra` more seconds.
+function TimeScale.extend(extra: number)
+	if current >= 1 then
+		return
+	end
+	holdUntil = math.max(holdUntil, os.clock()) + extra
+	current = slowScale
+end
+
+-- The moment (os.clock) the slow motion stops holding and starts to recover.
+function TimeScale.holdEndsAt(): number
+	return holdUntil
+end
+
+function TimeScale.cancel()
+	holdUntil = 0
+	current = 1
+end
+
+-- Call once per frame with the real frame time. Returns the scaled frame time.
+function TimeScale.step(realDelta: number): number
+	if current < 1 and os.clock() >= holdUntil then
+		current = math.min(1, current + (1 - slowScale) * realDelta / recoverTime)
+	end
+	return realDelta * current
+end
+
+return TimeScale
+]]></string>
+            </Properties>
+          </Item>
+        </Item>
+        <Item class="LocalScript" referent="54">
+          <Properties>
+            <string name="Name">Main</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	Client entry point. This is the only LocalScript; everything else is a
+	ModuleScript that this file loads.
+
+	Each controller may have:
+	  Init()   set itself up; must not rely on other controllers being ready
+	  Start()  connect events and begin work; every controller has been Init'd
+
+	PlotController starts last on purpose: it announces the plot (Ready,
+	FossilAdded...) as soon as it finds it, and every other controller must be
+	listening by then.
+]]
+
+local Controllers = script.Parent.Controllers
+local DebugController = require(Controllers.DebugController)
+local DigController = require(Controllers.DigController)
+local EffectsController = require(Controllers.EffectsController)
+local FossilController = require(Controllers.FossilController)
+local HudController = require(Controllers.HudController)
+local PlotController = require(Controllers.PlotController)
+local ToolController = require(Controllers.ToolController)
+
+local controllers: { any } = {
+	EffectsController,
+	ToolController,
+	FossilController,
+	DigController,
+	HudController,
+	DebugController,
+	PlotController,
+}
+
+for _, controller in controllers do
+	if controller.Init then
+		controller.Init()
+	end
+end
+
+for _, controller in controllers do
+	if controller.Start then
+		controller.Start()
+	end
+end
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="Folder" referent="55">
+          <Properties>
+            <string name="Name">Ui</string>
+          </Properties>
+          <Item class="ModuleScript" referent="56">
+            <Properties>
+              <string name="Name">Ui</string>
+              <string name="Source"><![CDATA[--!strict
+--[[
+	Ui: small helpers for building interface in code.
+
+	House rules for every piece of UI in this game (they keep it usable on
+	phones, where most Roblox play happens):
+	  * size and position with Scale, never fixed pixel Offsets
+	  * lock shapes with UIAspectRatioConstraint
+	  * cap how big things grow on large screens with UISizeConstraint
+	  * keep the bottom corners clear: the thumbstick and jump button live there
+]]
+
+local Players = game:GetService("Players")
+
+local Ui = {}
+
+local hud: ScreenGui? = nil
+
+-- Creates an instance, sets its properties and parents the given children to it.
+-- Returns `any` so callers can cast to the class they asked for.
+function Ui.create(className: string, properties: { [string]: any }, children: { Instance }?): any
+	local instance = Instance.new(className) :: any
+	for key, value in properties do
+		instance[key] = value
+	end
+	if children then
+		for _, child in children do
+			child.Parent = instance
+		end
+	end
+	return instance
+end
+
+-- The one ScreenGui every controller adds its interface to.
+function Ui.getHud(): ScreenGui
+	local existing = hud
+	if existing then
+		return existing
+	end
+	local playerGui = Players.LocalPlayer:WaitForChild("PlayerGui")
+	local created = Ui.create("ScreenGui", {
+		Name = "DigHud",
+		ResetOnSpawn = false,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+		DisplayOrder = 5,
+	}) :: ScreenGui
+	created.Parent = playerGui
+	hud = created
+	return created
+end
+
+return Ui
+]]></string>
+            </Properties>
+          </Item>
+        </Item>
+      </Item>
+    </Item>
+  </Item>
+</roblox>
