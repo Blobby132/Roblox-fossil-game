@@ -61,6 +61,11 @@ local GridConfig = {
 	-- Seconds between the last fossil being uncovered and the plot refilling.
 	RefillDelay = 8,
 
+	-- The plot never refills while its owner is extracting a fossil. If the
+	-- refill came due during an extraction, it happens this many seconds after
+	-- the extraction ends instead.
+	RefillDelayAfterExtraction = 3,
+
 	-- Surface hints: cracked / discoloured cells above buried fossils.
 	Hints = {
 		-- Chance (0-1) that a fossil gives hints at all. Below 1, some fossils

@@ -30,6 +30,9 @@ export type FossilState = {
 	Stage: FossilStage,
 	Clean: number, -- brush strokes done so far
 	CleanNeeded: number,
+	-- Set once an extraction has started for this fossil, so it can never
+	-- be extracted twice.
+	ExtractionStarted: boolean,
 }
 
 export type PlotState = {

@@ -16,17 +16,27 @@ local Remotes = require(ReplicatedStorage.Shared.Remotes)
 Remotes.createAll()
 
 local Services = script.Parent.Services
+local AnalyticsService = require(Services.AnalyticsService)
+local DataService = require(Services.DataService)
 local DebugService = require(Services.DebugService)
 local DigService = require(Services.DigService)
+local ExtractionService = require(Services.ExtractionService)
 local FossilService = require(Services.FossilService)
+local InventoryService = require(Services.InventoryService)
 local PlotService = require(Services.PlotService)
 local ToolService = require(Services.ToolService)
 
--- Later milestones add MuseumService, EconomyService and DataService here.
+-- DataService starts first, so a joining player's data exists before any
+-- other service handles them. Later milestones add MuseumService and
+-- EconomyService here.
 local services: { any } = {
+	DataService,
+	AnalyticsService,
 	PlotService,
 	FossilService,
 	ToolService,
+	InventoryService,
+	ExtractionService,
 	DigService,
 	DebugService,
 }

@@ -13,6 +13,44 @@
         </Properties>
         <Item class="ModuleScript" referent="3">
           <Properties>
+            <string name="Name">AnalyticsConfig</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	AnalyticsConfig: what AnalyticsService (the server-side wrapper) reports
+	to Roblox's analytics.
+
+	The onboarding funnel shows in the Creator Dashboard under Analytics ->
+	Funnels once the game is published and has players. Each step is logged at
+	most once per player per session, in the order listed here; Roblox numbers
+	them 1, 2, 3...
+
+	Milestone 5 extends this into the full funnel.
+]]
+
+local AnalyticsConfig = {
+	-- Onboarding funnel steps, in order. The names are what the dashboard shows.
+	-- "Joined" is the baseline the other steps are measured against.
+	OnboardingSteps = {
+		"Joined",
+		"FirstSwing",
+		"FirstFossilUncovered",
+		"FirstExtraction",
+	},
+
+	-- In Studio, events are not sent to Roblox (they would mix test sessions
+	-- into real data). Set to true only to test the real calls.
+	SendInStudio = false,
+
+	-- In Studio, print each event to the Output window instead.
+	PrintInStudio = true,
+}
+
+return AnalyticsConfig
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="4">
+          <Properties>
             <string name="Name">DebugConfig</string>
             <string name="Source"><![CDATA[--!strict
 --[[
@@ -42,7 +80,7 @@ return DebugConfig
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="4">
+        <Item class="ModuleScript" referent="5">
           <Properties>
             <string name="Name">DigConfig</string>
             <string name="Source"><![CDATA[--!strict
@@ -81,7 +119,226 @@ return DigConfig
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="5">
+        <Item class="ModuleScript" referent="6">
+          <Properties>
+            <string name="Name">ExtractionConfig</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	ExtractionConfig: the extraction minigame that starts the moment a fossil
+	is uncovered.
+
+	A marker sweeps back and forth along a bar. The player stops it Hits times.
+	Each stop is rated Perfect, Good or Miss by how close the marker is to the
+	centre of the safe zone, and the ratings add up to the fossil's condition
+	(1-100). A fossil is never destroyed: three misses still give the fossil,
+	just in poor condition.
+
+	Units:
+	  positions and widths  fractions of the bar (0 = left end, 1 = right end)
+	  speeds                bar lengths per second
+	  times                 seconds
+
+	The SERVER rates every tap using the rule values here (see ExtractionRules),
+	so changing them changes real results. The Feel section only changes what
+	this player sees and hears, and is safe to tune freely.
+]]
+
+export type RarityModifier = {
+	SpeedScale: number, -- multiplies the marker speed
+	ZoneScale: number, -- multiplies both zone widths
+}
+
+export type PointRange = {
+	Min: number, -- condition points at the outer edge of this rating's band
+	Max: number, -- condition points at the inner edge (the zone centre for Perfect)
+}
+
+export type Grade = {
+	Min: number, -- lowest condition that earns this grade
+	Name: string,
+	Color: Color3,
+}
+
+export type RatingFeel = {
+	Text: string, -- the popup above the bar
+	Sound: string, -- key in SoundConfig
+	Color: Color3,
+	Flash: number, -- panel flash at its brightest: 0 = solid white, 1 = no flash
+	Shake: number, -- camera shake, 0-1
+	PanelShake: number, -- how far the panel jolts sideways (fraction of the screen)
+	Chips: number, -- bits that fly off the fossil
+	Sparkles: number, -- sparkle burst on the fossil (multiplier; 0 = none)
+	Bump: number, -- how much the fossil swells for an instant (fraction of its size)
+}
+
+local RATING_FEEL: { [string]: RatingFeel } = {
+	Perfect = {
+		Text = "PERFECT!",
+		Sound = "ExtractPerfect",
+		Color = Color3.fromRGB(255, 214, 80),
+		Flash = 0.35,
+		Shake = 0,
+		PanelShake = 0,
+		Chips = 0,
+		Sparkles = 0.6,
+		Bump = 0.18,
+	},
+	Good = {
+		Text = "GOOD",
+		Sound = "ExtractGood",
+		Color = Color3.fromRGB(130, 225, 120),
+		Flash = 0.8,
+		Shake = 0,
+		PanelShake = 0,
+		Chips = 0,
+		Sparkles = 0,
+		Bump = 0.08,
+	},
+	Miss = {
+		Text = "MISS",
+		Sound = "ExtractMiss",
+		Color = Color3.fromRGB(235, 95, 85),
+		Flash = 1,
+		Shake = 0.3,
+		PanelShake = 0.012,
+		Chips = 5,
+		Sparkles = 0,
+		Bump = 0,
+	},
+}
+
+local RARITY_MODIFIERS: { [string]: RarityModifier } = {
+	Common = { SpeedScale = 1, ZoneScale = 1 },
+	Uncommon = { SpeedScale = 1.07, ZoneScale = 0.93 },
+	Rare = { SpeedScale = 1.15, ZoneScale = 0.85 },
+}
+
+-- Best first. A fossil gets the first grade whose Min its condition reaches.
+local GRADES: { Grade } = {
+	{ Min = 95, Name = "Pristine", Color = Color3.fromRGB(255, 214, 80) },
+	{ Min = 80, Name = "Excellent", Color = Color3.fromRGB(120, 230, 140) },
+	{ Min = 60, Name = "Fine", Color = Color3.fromRGB(185, 225, 120) },
+	{ Min = 40, Name = "Fair", Color = Color3.fromRGB(235, 205, 110) },
+	{ Min = 20, Name = "Worn", Color = Color3.fromRGB(235, 150, 90) },
+	{ Min = 0, Name = "Damaged", Color = Color3.fromRGB(225, 100, 90) },
+}
+
+local ExtractionConfig = {
+	-- Taps per extraction.
+	Hits = 3,
+
+	-- Seconds from the fossil being uncovered until the marker starts moving.
+	-- Long enough for the reveal moment (slow motion and pop) to play first.
+	StartDelay = 1.6,
+
+	-- Marker speed on the first hit, in bar lengths per second.
+	BaseSpeed = 0.95,
+
+	-- Speed multiplier for each hit in turn, so the last hit is the hardest.
+	-- Needs one entry per hit; a missing entry counts as the last one.
+	SpeedPerHit = { 1, 1.08, 1.16 },
+
+	-- After each tap the marker freezes this long, so the rating can be seen.
+	HitPause = 0.45,
+
+	-- The safe zone. Perfect is a narrow band in the middle of the Good band.
+	-- Each hit gets a new zone at a random spot.
+	Zone = {
+		GoodWidth = 0.28,
+		PerfectWidth = 0.09,
+		EdgeMargin = 0.04, -- smallest gap between the zone and either end of the bar
+		-- Each zone is at least this far from the previous zone (or from where
+		-- the marker starts), so the marker never resumes already inside it.
+		MinShift = 0.3,
+	},
+
+	-- Rarer fossils are harder: a faster marker and a smaller zone. A rarity
+	-- missing from this list uses Common.
+	ByRarity = RARITY_MODIFIERS,
+
+	-- How the ratings become the fossil's condition:
+	--   condition = Base + points from every hit, rounded, kept within 1-100.
+	-- Within each rating, points scale with accuracy, so two Goods are rarely
+	-- worth exactly the same. With these numbers, three dead-centre Perfects
+	-- make exactly 100 and three bad misses make about 10.
+	Condition = {
+		Base = 1,
+		Perfect = { Min = 30, Max = 33 } :: PointRange,
+		Good = { Min = 18, Max = 26 } :: PointRange,
+		Miss = { Min = 3, Max = 8 } :: PointRange,
+		-- A Miss is worth Miss.Max just outside the Good band, falling to
+		-- Miss.Min this far (bar fraction) beyond it.
+		MissFalloff = 0.25,
+	},
+
+	-- Names for condition ranges, shown as "Ammonite: Excellent, 87%".
+	Grades = GRADES,
+
+	-- What the server tolerates. Every tap carries the moment the player
+	-- tapped, in server time; the server rates the marker at that moment.
+	Server = {
+		-- How old a tap's timestamp may be when it arrives (network lag).
+		-- Older timestamps are moved forward to this limit, never trusted as is.
+		LagAllowance = 0.6,
+		-- How far ahead of the server's clock a timestamp may be (clock sync jitter).
+		ClockTolerance = 0.1,
+		-- Taps arriving closer together than this are rejected as too fast.
+		MinTapInterval = 0.15,
+		-- An extraction left alone this long after the marker starts finishes
+		-- by itself; missing taps count as misses.
+		MaxDuration = 25,
+		-- Flood protection, as in DigConfig.
+		MaxRequestsPerSecond = 6,
+		RequestBurst = 4,
+		-- The uncovered fossil part is removed this long after extraction, so
+		-- the client has time to play the "collected" animation.
+		RemovePartDelay = 3,
+	},
+
+	-- Client-side presentation only.
+	Feel = {
+		OpenLead = 0.45, -- the bar appears this long before the marker starts
+		OpenTime = 0.25, -- pop-in tween
+		CloseTime = 0.2,
+		OpenSound = "ExtractOpen",
+
+		Ratings = RATING_FEEL,
+		FlashTime = 0.3, -- seconds for a flash to fade
+		PanelShakeTime = 0.25,
+		PopupTime = 0.7, -- seconds the PERFECT / GOOD / MISS popup floats
+		BumpTime = 0.2, -- seconds for the fossil's swell to settle
+
+		-- The "Extracted!" moment.
+		ExtractedSound = "Extracted",
+		ExtractedShake = 0.2,
+		ResultHoldTime = 2.8, -- seconds it stays up
+		MinResultTime = 0.7, -- after this long, a tap closes it early
+		CollectTime = 0.5, -- the fossil shrinks and flies away
+		CollectRise = 5, -- studs it rises as it goes
+
+		-- Give up waiting for the server's final result after this long.
+		MaxWaitForServer = 4,
+
+		Colors = {
+			Panel = Color3.fromRGB(34, 32, 36),
+			Stroke = Color3.fromRGB(14, 12, 14),
+			Track = Color3.fromRGB(70, 62, 56),
+			GoodZone = Color3.fromRGB(110, 190, 105),
+			PerfectZone = Color3.fromRGB(255, 214, 80),
+			Marker = Color3.fromRGB(250, 248, 240),
+			PipEmpty = Color3.fromRGB(80, 76, 80),
+			Text = Color3.fromRGB(250, 246, 235),
+			Hint = Color3.fromRGB(190, 184, 172),
+			Header = Color3.fromRGB(255, 214, 80),
+		},
+	},
+}
+
+return ExtractionConfig
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="7">
           <Properties>
             <string name="Name">FeelConfig</string>
             <string name="Source"><![CDATA[--!strict
@@ -430,7 +687,7 @@ return FeelConfig
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="6">
+        <Item class="ModuleScript" referent="8">
           <Properties>
             <string name="Name">FossilConfig</string>
             <string name="Source"><![CDATA[--!strict
@@ -561,7 +818,7 @@ return FossilConfig
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="7">
+        <Item class="ModuleScript" referent="9">
           <Properties>
             <string name="Name">GridConfig</string>
             <string name="Source"><![CDATA[--!strict
@@ -627,6 +884,11 @@ local GridConfig = {
 	-- Seconds between the last fossil being uncovered and the plot refilling.
 	RefillDelay = 8,
 
+	-- The plot never refills while its owner is extracting a fossil. If the
+	-- refill came due during an extraction, it happens this many seconds after
+	-- the extraction ends instead.
+	RefillDelayAfterExtraction = 3,
+
 	-- Surface hints: cracked / discoloured cells above buried fossils.
 	Hints = {
 		-- Chance (0-1) that a fossil gives hints at all. Below 1, some fossils
@@ -657,7 +919,7 @@ return GridConfig
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="8">
+        <Item class="ModuleScript" referent="10">
           <Properties>
             <string name="Name">MaterialConfig</string>
             <string name="Source"><![CDATA[--!strict
@@ -698,7 +960,7 @@ return MaterialConfig
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="9">
+        <Item class="ModuleScript" referent="11">
           <Properties>
             <string name="Name">RarityConfig</string>
             <string name="Source"><![CDATA[--!strict
@@ -741,7 +1003,7 @@ return RarityConfig
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="10">
+        <Item class="ModuleScript" referent="12">
           <Properties>
             <string name="Name">SoundConfig</string>
             <string name="Source"><![CDATA[--!strict
@@ -843,6 +1105,33 @@ local SOUNDS: { [string]: { SoundLayer } } = {
 		{ Id = TICK, Volume = 0.7, Pitch = 2.52, Delay = 0.3 },
 	},
 
+	-- Extraction minigame. Perfect is crisp and bright, Good softer, Miss a
+	-- dull thunk. Extracted is the "into your collection" moment at the end.
+	ExtractOpen = {
+		{ Id = WHUP, Volume = 0.35, Pitch = 1.3 },
+	},
+	ExtractPerfect = {
+		{ Id = TICK, Volume = 0.8, Pitch = 2.4 },
+		{ Id = TICK, Volume = 0.6, Pitch = 3.2, Delay = 0.04 },
+	},
+	ExtractGood = {
+		{ Id = TICK, Volume = 0.45, Pitch = 1.5 },
+	},
+	ExtractMiss = {
+		{ Id = THUD, Volume = 0.75, Pitch = 0.5, Length = 0.35 },
+		{ Id = TICK, Volume = 0.25, Pitch = 0.35 },
+	},
+	Extracted = {
+		{ Id = THUD, Volume = 0.5, Pitch = 0.8 },
+		{ Id = TICK, Volume = 0.65, Pitch = 1.26 },
+		{ Id = TICK, Volume = 0.65, Pitch = 1.5, Delay = 0.08 },
+		{ Id = TICK, Volume = 0.65, Pitch = 1.89, Delay = 0.16 },
+		{ Id = TICK, Volume = 0.7, Pitch = 2.52, Delay = 0.26 },
+	},
+	InventoryOpen = {
+		{ Id = RUSTLE, Volume = 0.3, Pitch = 1.4, Length = 0.25 },
+	},
+
 	-- The plot refills with fresh ground.
 	Refill = {
 		{ Id = BOOM, Volume = 0.2, Pitch = 0.6, Length = 0.9 },
@@ -861,7 +1150,7 @@ return SoundConfig
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="11">
+        <Item class="ModuleScript" referent="13">
           <Properties>
             <string name="Name">ToolConfig</string>
             <string name="Source"><![CDATA[--!strict
@@ -953,7 +1242,7 @@ return ToolConfig
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="12">
+        <Item class="ModuleScript" referent="14">
           <Properties>
             <string name="Name">WorldConfig</string>
             <string name="Source"><![CDATA[--!strict
@@ -1028,11 +1317,11 @@ return WorldConfig
           </Properties>
         </Item>
       </Item>
-      <Item class="Folder" referent="13">
+      <Item class="Folder" referent="15">
         <Properties>
           <string name="Name">Dig</string>
         </Properties>
-        <Item class="ModuleScript" referent="14">
+        <Item class="ModuleScript" referent="16">
           <Properties>
             <string name="Name">DigRules</string>
             <string name="Source"><![CDATA[--!strict
@@ -1115,7 +1404,7 @@ return DigRules
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="15">
+        <Item class="ModuleScript" referent="17">
           <Properties>
             <string name="Name">GridMath</string>
             <string name="Source"><![CDATA[--!strict
@@ -1208,7 +1497,340 @@ return GridMath
           </Properties>
         </Item>
       </Item>
-      <Item class="ModuleScript" referent="16">
+      <Item class="Folder" referent="18">
+        <Properties>
+          <string name="Name">Extraction</string>
+        </Properties>
+        <Item class="ModuleScript" referent="19">
+          <Properties>
+            <string name="Name">ExtractionMath</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	ExtractionMath: the pure maths of the extraction minigame.
+
+	Shared by both sides: the server rates every tap with it, and the client
+	uses the same functions to draw the marker and predict the rating, so
+	feedback is instant and normally matches the server exactly.
+
+	The marker moves in "segments". A segment says where the marker starts,
+	which way it is heading, how fast it goes and when it sets off. After each
+	tap the next segment starts from where the marker stopped. Given a segment
+	and a moment in time, the marker's position is fully determined.
+]]
+
+local ExtractionConfig = require(script.Parent.Parent.Config.ExtractionConfig)
+
+export type Rating = "Perfect" | "Good" | "Miss"
+
+export type Segment = {
+	Hit: number, -- which tap this segment is waiting for (1 = first)
+	StartAt: number, -- server time the marker sets off
+	StartPos: number, -- 0-1 along the bar
+	StartDir: number, -- 1 = moving right, -1 = moving left
+	Speed: number, -- bar lengths per second
+}
+
+local ExtractionMath = {}
+
+local function lerp(from: number, to: number, alpha: number): number
+	return from + (to - from) * math.clamp(alpha, 0, 1)
+end
+
+-- Where the marker is at `time`, and which way it is moving (1 or -1).
+-- Before the segment starts, the marker waits at its start position.
+-- The marker bounces off both ends of the bar.
+function ExtractionMath.positionAt(segment: Segment, time: number): (number, number)
+	local elapsed = math.max(0, time - segment.StartAt)
+	-- Unfold the bounces: travel along a line of length 2 and fold it back.
+	local start = if segment.StartDir >= 0 then segment.StartPos else 2 - segment.StartPos
+	local unfolded = (start + segment.Speed * elapsed) % 2
+	if unfolded <= 1 then
+		return unfolded, 1
+	end
+	return 2 - unfolded, -1
+end
+
+-- Rates a stop at `position` against a zone centred on `center`.
+-- Returns the rating and the condition points it is worth.
+function ExtractionMath.rate(
+	position: number,
+	center: number,
+	perfectWidth: number,
+	goodWidth: number
+): (Rating, number)
+	local condition = ExtractionConfig.Condition
+	local distance = math.abs(position - center)
+	local perfectHalf = perfectWidth / 2
+	local goodHalf = math.max(goodWidth / 2, perfectHalf)
+
+	if distance <= perfectHalf then
+		local alpha = if perfectHalf > 0 then distance / perfectHalf else 0
+		return "Perfect", lerp(condition.Perfect.Max, condition.Perfect.Min, alpha)
+	end
+	if distance <= goodHalf then
+		local alpha = (distance - perfectHalf) / (goodHalf - perfectHalf)
+		return "Good", lerp(condition.Good.Max, condition.Good.Min, alpha)
+	end
+	local alpha = (distance - goodHalf) / math.max(condition.MissFalloff, 1e-6)
+	return "Miss", lerp(condition.Miss.Max, condition.Miss.Min, alpha)
+end
+
+-- The fossil's condition (1-100) from the points of every hit.
+function ExtractionMath.condition(points: { number }): number
+	local total = ExtractionConfig.Condition.Base
+	for _, value in points do
+		total += value
+	end
+	return math.clamp(math.round(total), 1, 100)
+end
+
+-- The named grade for a condition ("Excellent").
+function ExtractionMath.grade(condition: number): ExtractionConfig.Grade
+	local grades = ExtractionConfig.Grades
+	for _, grade in grades do
+		if condition >= grade.Min then
+			return grade
+		end
+	end
+	return grades[#grades]
+end
+
+-- "Ammonite: Excellent, 87%"
+function ExtractionMath.describe(displayName: string, condition: number): string
+	return `{displayName}: {ExtractionMath.grade(condition).Name}, {condition}%`
+end
+
+function ExtractionMath.modifiersFor(rarity: string): ExtractionConfig.RarityModifier
+	local byRarity = ExtractionConfig.ByRarity
+	return byRarity[rarity] or byRarity.Common or { SpeedScale = 1, ZoneScale = 1 }
+end
+
+-- Perfect and Good zone widths for a fossil of this rarity.
+function ExtractionMath.zoneWidthsFor(rarity: string): (number, number)
+	local zone = ExtractionConfig.Zone
+	local scale = ExtractionMath.modifiersFor(rarity).ZoneScale
+	local good = math.clamp(zone.GoodWidth * scale, 0.01, 1)
+	local perfect = math.clamp(zone.PerfectWidth * scale, 0, good)
+	return perfect, good
+end
+
+-- Marker speed for each hit, for a fossil of this rarity.
+function ExtractionMath.speedsFor(rarity: string): { number }
+	local perHit = ExtractionConfig.SpeedPerHit
+	local base = ExtractionConfig.BaseSpeed * ExtractionMath.modifiersFor(rarity).SpeedScale
+	local speeds: { number } = {}
+	for hit = 1, ExtractionConfig.Hits do
+		local multiplier = perHit[math.min(hit, #perHit)] or 1
+		speeds[hit] = math.max(base * multiplier, 0.05)
+	end
+	return speeds
+end
+
+-- Picks a zone centre that keeps the whole Good band on the bar and, where
+-- possible, sits at least Zone.MinShift away from `reference`.
+-- nextNumber returns a random number from 0 (inclusive) to 1 (exclusive).
+function ExtractionMath.pickZone(
+	nextNumber: () -> number,
+	reference: number,
+	goodWidth: number
+): number
+	local zone = ExtractionConfig.Zone
+	local low = math.min(goodWidth / 2 + zone.EdgeMargin, 0.5)
+	local high = math.max(1 - goodWidth / 2 - zone.EdgeMargin, 0.5)
+
+	-- Two allowed stretches: left of the reference, and right of it.
+	local leftEnd = math.min(high, reference - zone.MinShift)
+	local rightStart = math.max(low, reference + zone.MinShift)
+	local leftLength = math.max(0, leftEnd - low)
+	local rightLength = math.max(0, high - rightStart)
+	local total = leftLength + rightLength
+	if total <= 0 then
+		-- Nowhere is far enough away: use whichever end is furthest.
+		return if math.abs(low - reference) >= math.abs(high - reference) then low else high
+	end
+	local roll = nextNumber() * total
+	if roll < leftLength then
+		return low + roll
+	end
+	return rightStart + (roll - leftLength)
+end
+
+return ExtractionMath
+]]></string>
+          </Properties>
+        </Item>
+      </Item>
+      <Item class="Folder" referent="20">
+        <Properties>
+          <string name="Name">Inventory</string>
+        </Properties>
+        <Item class="ModuleScript" referent="21">
+          <Properties>
+            <string name="Name">InventoryLogic</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	InventoryLogic: what an inventory entry is, how a list of them is sorted,
+	and how far along a fossil set is. Pure logic shared by the server (which
+	owns the inventory) and the client (which displays it).
+
+	Every find is its own entry, so two Ammonites in different condition are
+	two entries.
+]]
+
+local Shared = script.Parent.Parent
+local FossilConfig = require(Shared.Config.FossilConfig)
+local RarityConfig = require(Shared.Config.RarityConfig)
+
+export type Entry = {
+	Id: number, -- unique within this player's inventory, never reused
+	FossilId: string, -- key in FossilConfig
+	Rarity: string, -- key in RarityConfig, stored so old finds keep their rarity
+	Condition: number, -- 1-100
+	FoundAt: number, -- os.time() when the fossil was uncovered
+}
+
+export type SetPiece = {
+	FossilId: string,
+	DisplayName: string,
+	Owned: boolean,
+}
+
+export type SetProgress = {
+	SetId: string,
+	DisplayName: string,
+	Owned: number, -- distinct pieces owned
+	Total: number,
+	Pieces: { SetPiece },
+}
+
+local InventoryLogic = {}
+
+local function rarityOrder(rarity: string): number
+	local def = RarityConfig.Rarities[rarity]
+	return if def then def.Order else 0
+end
+
+-- True if `a` should be listed before `b`: rarest first, then best
+-- condition, then newest, then the order they were found.
+function InventoryLogic.comesBefore(a: Entry, b: Entry): boolean
+	local rarityA, rarityB = rarityOrder(a.Rarity), rarityOrder(b.Rarity)
+	if rarityA ~= rarityB then
+		return rarityA > rarityB
+	end
+	if a.Condition ~= b.Condition then
+		return a.Condition > b.Condition
+	end
+	if a.FoundAt ~= b.FoundAt then
+		return a.FoundAt > b.FoundAt
+	end
+	return a.Id < b.Id
+end
+
+-- A sorted copy of the list. The original is left untouched.
+function InventoryLogic.sorted(entries: { Entry }): { Entry }
+	local copy = table.clone(entries)
+	table.sort(copy, InventoryLogic.comesBefore)
+	return copy
+end
+
+function InventoryLogic.copyEntry(entry: Entry): Entry
+	return {
+		Id = entry.Id,
+		FossilId = entry.FossilId,
+		Rarity = entry.Rarity,
+		Condition = entry.Condition,
+		FoundAt = entry.FoundAt,
+	}
+end
+
+-- How many distinct pieces of a set appear in the list.
+function InventoryLogic.setProgress(entries: { Entry }, setId: string): SetProgress?
+	local set = FossilConfig.Sets[setId]
+	if set == nil then
+		return nil
+	end
+	local owned: { [string]: boolean } = {}
+	for _, entry in entries do
+		owned[entry.FossilId] = true
+	end
+	local pieces: { SetPiece } = {}
+	local count = 0
+	for _, fossilId in set.Pieces do
+		local def = FossilConfig.ById[fossilId]
+		local has = owned[fossilId] == true
+		if has then
+			count += 1
+		end
+		table.insert(pieces, {
+			FossilId = fossilId,
+			DisplayName = if def then def.DisplayName else fossilId,
+			Owned = has,
+		})
+	end
+	return {
+		SetId = setId,
+		DisplayName = set.DisplayName,
+		Owned = count,
+		Total = #set.Pieces,
+		Pieces = pieces,
+	}
+end
+
+-- Progress for every set, in a stable (alphabetical) order.
+function InventoryLogic.allSetProgress(entries: { Entry }): { SetProgress }
+	local ids: { string } = {}
+	for setId in FossilConfig.Sets do
+		table.insert(ids, setId)
+	end
+	table.sort(ids)
+	local result: { SetProgress } = {}
+	for _, setId in ids do
+		local progress = InventoryLogic.setProgress(entries, setId)
+		if progress then
+			table.insert(result, progress)
+		end
+	end
+	return result
+end
+
+local function isWholeNumber(value: any): boolean
+	return typeof(value) == "number" and value == value and value % 1 == 0
+end
+
+-- Checks a value really is an entry (the client uses this on data from the
+-- network). Returns a clean copy, or nil.
+function InventoryLogic.validate(value: any): Entry?
+	if typeof(value) ~= "table" then
+		return nil
+	end
+	local fossilId, rarity, condition = value.FossilId, value.Rarity, value.Condition
+	if not isWholeNumber(value.Id) or not isWholeNumber(value.FoundAt) then
+		return nil
+	end
+	if typeof(fossilId) ~= "string" or FossilConfig.ById[fossilId] == nil then
+		return nil
+	end
+	if typeof(rarity) ~= "string" or RarityConfig.Rarities[rarity] == nil then
+		return nil
+	end
+	if not isWholeNumber(condition) or condition < 1 or condition > 100 then
+		return nil
+	end
+	return {
+		Id = value.Id,
+		FossilId = fossilId,
+		Rarity = rarity,
+		Condition = condition,
+		FoundAt = value.FoundAt,
+	}
+end
+
+return InventoryLogic
+]]></string>
+          </Properties>
+        </Item>
+      </Item>
+      <Item class="ModuleScript" referent="22">
         <Properties>
           <string name="Name">Remotes</string>
           <string name="Source"><![CDATA[--!strict
@@ -1225,17 +1847,41 @@ return GridMath
 	      "I want to hold this tool."
 	  DebugRequest(action: string)
 	      Developer shortcuts. Ignored unless DebugService allows the player.
+	  ExtractionTap(id: number, tapTime: number)
+	      "I tapped during extraction `id` at this moment" (server time, from
+	      Workspace:GetServerTimeNow()). Never a rating: the server works out
+	      where the marker was.
+	  InventoryRequest()
+	      "Send me my whole inventory." Sent once when the client starts.
 
 	Server -> client:
 	  SwingResult(seq: number, ok: boolean, code: string, value: number, defId: string?)
 	      The server's ruling on one SwingRequest.
 	      code:  Hit | Break | Clean | Reveal            (ok = true)
 	             WrongTool | TooFar | Cooldown | NotExposed | NothingThere |
-	             AlreadyRevealed | NoPlot | NoTool | NoCharacter   (ok = false)
+	             AlreadyRevealed | NoPlot | NoTool | NoCharacter |
+	             Extracting                              (ok = false)
 	      value: cell health left (Hit, Break) or cleaning strokes done (Clean, Reveal)
 	      defId: the fossil's id, only on Reveal
 	  DebugFossils(cellIndices: { number })
 	      Developer shortcut: where the buried fossils are.
+	  ExtractionStarted(id: number, info: table)
+	      An uncovered fossil's extraction has begun. info holds everything
+	      needed to draw it: FossilId, Rarity, CellIndex, Hits, StartAt,
+	      Deadline, Speeds, StartPos, StartDir, Zones, PerfectWidth, GoodWidth,
+	      HitPause (see ExtractionService).
+	  ExtractionTapResult(id: number, result: table)
+	      The ruling on one ExtractionTap: Ok, Code (Perfect | Good | Miss, or
+	      Finished | NotStarted | TooFast | NotYours), Hit, Rating, Position,
+	      RatedAt, Done (hits rated so far) and Next (the segment the marker
+	      is on now, or nil once every hit is rated).
+	  ExtractionFinished(id: number, result: table)
+	      The fossil is extracted: EntryId, FossilId, Rarity, Condition,
+	      Ratings, TimedOut.
+	  InventorySync(entries: { Entry })
+	      The whole inventory (see InventoryLogic.Entry).
+	  InventoryAdded(entry: Entry)
+	      One new inventory entry.
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -1247,6 +1893,13 @@ export type RemoteName =
 	| "EquipRequest"
 	| "DebugRequest"
 	| "DebugFossils"
+	| "ExtractionStarted"
+	| "ExtractionTap"
+	| "ExtractionTapResult"
+	| "ExtractionFinished"
+	| "InventoryRequest"
+	| "InventorySync"
+	| "InventoryAdded"
 
 local FOLDER_NAME = "Remotes"
 
@@ -1256,6 +1909,13 @@ local NAMES: { RemoteName } = {
 	"EquipRequest",
 	"DebugRequest",
 	"DebugFossils",
+	"ExtractionStarted",
+	"ExtractionTap",
+	"ExtractionTapResult",
+	"ExtractionFinished",
+	"InventoryRequest",
+	"InventorySync",
+	"InventoryAdded",
 }
 
 local Remotes = {}
@@ -1292,11 +1952,11 @@ return Remotes
 ]]></string>
         </Properties>
       </Item>
-      <Item class="Folder" referent="17">
+      <Item class="Folder" referent="23">
         <Properties>
           <string name="Name">Util</string>
         </Properties>
-        <Item class="ModuleScript" referent="18">
+        <Item class="ModuleScript" referent="24">
           <Properties>
             <string name="Name">Signal</string>
             <string name="Source"><![CDATA[--!strict
@@ -1353,19 +2013,19 @@ return Signal
       </Item>
     </Item>
   </Item>
-  <Item class="ServerScriptService" referent="19">
+  <Item class="ServerScriptService" referent="25">
     <Properties>
       <string name="Name">ServerScriptService</string>
     </Properties>
-    <Item class="Folder" referent="20">
+    <Item class="Folder" referent="26">
       <Properties>
         <string name="Name">Server</string>
       </Properties>
-      <Item class="Folder" referent="21">
+      <Item class="Folder" referent="27">
         <Properties>
           <string name="Name">Dig</string>
         </Properties>
-        <Item class="ModuleScript" referent="22">
+        <Item class="ModuleScript" referent="28">
           <Properties>
             <string name="Name">PlotGenerator</string>
             <string name="Source"><![CDATA[--!strict
@@ -1466,6 +2126,7 @@ function PlotGenerator.generate(nextNumber: () -> number): PlotRules.PlotState
 			Stage = "Buried",
 			Clean = 0,
 			CleanNeeded = def.CleanStrokes,
+			ExtractionStarted = false,
 		}
 
 		-- 3. Hints: the fossil's own cell and the cells above it, fading with distance.
@@ -1492,7 +2153,7 @@ return PlotGenerator
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="23">
+        <Item class="ModuleScript" referent="29">
           <Properties>
             <string name="Name">PlotRules</string>
             <string name="Source"><![CDATA[--!strict
@@ -1527,6 +2188,9 @@ export type FossilState = {
 	Stage: FossilStage,
 	Clean: number, -- brush strokes done so far
 	CleanNeeded: number,
+	-- Set once an extraction has started for this fossil, so it can never
+	-- be extracted twice.
+	ExtractionStarted: boolean,
 }
 
 export type PlotState = {
@@ -1621,7 +2285,210 @@ return PlotRules
           </Properties>
         </Item>
       </Item>
-      <Item class="Script" referent="24">
+      <Item class="Folder" referent="30">
+        <Properties>
+          <string name="Name">Extraction</string>
+        </Properties>
+        <Item class="ModuleScript" referent="31">
+          <Properties>
+            <string name="Name">ExtractionRules</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	ExtractionRules: the authoritative state of one extraction, and what a tap
+	does to it.
+
+	Plain data and pure logic, like PlotRules: no players, no network, and
+	times are passed in. ExtractionService turns the outcomes into messages.
+
+	What the server decides, and the client never gets a say in:
+	  * the marker's speed for every hit, where it starts and which way it goes
+	  * where each hit's zone is, and how wide
+	  * when the marker sets off
+	The client only reports WHEN the player tapped. The server works out where
+	the marker was at that moment and rates it.
+
+	A tap's timestamp is trusted only within a small window around when it
+	arrived (Server.LagAllowance behind, Server.ClockTolerance ahead). Outside
+	that window it is moved to the nearest edge, so an old or future timestamp
+	can never pick a better moment than an honest tap sent on time.
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Shared = ReplicatedStorage.Shared
+local ExtractionConfig = require(Shared.Config.ExtractionConfig)
+local ExtractionMath = require(Shared.Extraction.ExtractionMath)
+
+export type Setup = {
+	Rarity: string,
+	Hits: number,
+	StartAt: number, -- server time the marker first sets off
+	Deadline: number, -- server time the extraction finishes by itself
+	Speeds: { number }, -- marker speed for each hit
+	StartPos: number,
+	StartDir: number,
+	Zones: { number }, -- zone centre for each hit
+	PerfectWidth: number,
+	GoodWidth: number,
+	HitPause: number,
+}
+
+export type State = {
+	Setup: Setup,
+	Segment: ExtractionMath.Segment?, -- the segment waiting for the next tap; nil once finished
+	Ratings: { ExtractionMath.Rating },
+	Points: { number },
+	LastArrival: number, -- when the last accepted tap arrived
+	Finished: boolean,
+	TimedOut: boolean,
+}
+
+export type TapOutcome = {
+	Ok: boolean,
+	-- Ok:     Perfect | Good | Miss
+	-- Not ok: Finished | NotStarted | TooFast
+	Code: string,
+	Hit: number?, -- which tap this was
+	Rating: ExtractionMath.Rating?,
+	Position: number?, -- where the marker stopped
+	RatedAt: number?, -- the moment the server rated (the timestamp after any adjustment)
+}
+
+local ExtractionRules = {}
+
+local function fail(code: string): TapOutcome
+	return { Ok = false, Code = code }
+end
+
+-- A new extraction for a fossil of this rarity.
+--   now         server time right now
+--   nextNumber  random number from 0 (inclusive) to 1 (exclusive)
+function ExtractionRules.new(rarity: string, now: number, nextNumber: () -> number): State
+	local hits = math.max(1, ExtractionConfig.Hits)
+	local perfectWidth, goodWidth = ExtractionMath.zoneWidthsFor(rarity)
+	local speeds = ExtractionMath.speedsFor(rarity)
+	local startPos = nextNumber()
+	local startDir = if nextNumber() < 0.5 then 1 else -1
+
+	local zones: { number } = {}
+	local reference = startPos
+	for hit = 1, hits do
+		zones[hit] = ExtractionMath.pickZone(nextNumber, reference, goodWidth)
+		reference = zones[hit]
+	end
+
+	local startAt = now + ExtractionConfig.StartDelay
+	local setup: Setup = {
+		Rarity = rarity,
+		Hits = hits,
+		StartAt = startAt,
+		Deadline = startAt + ExtractionConfig.Server.MaxDuration,
+		Speeds = speeds,
+		StartPos = startPos,
+		StartDir = startDir,
+		Zones = zones,
+		PerfectWidth = perfectWidth,
+		GoodWidth = goodWidth,
+		HitPause = ExtractionConfig.HitPause,
+	}
+	return {
+		Setup = setup,
+		Segment = {
+			Hit = 1,
+			StartAt = startAt,
+			StartPos = startPos,
+			StartDir = startDir,
+			Speed = speeds[1],
+		},
+		Ratings = {},
+		Points = {},
+		LastArrival = -math.huge,
+		Finished = false,
+		TimedOut = false,
+	}
+end
+
+-- Rates one tap.
+--   claimed  the moment the player says they tapped (server time)
+--   arrival  the server time the tap arrived
+function ExtractionRules.tap(state: State, claimed: number, arrival: number): TapOutcome
+	local segment = state.Segment
+	if state.Finished or segment == nil then
+		return fail("Finished")
+	end
+	local limits = ExtractionConfig.Server
+	if arrival - state.LastArrival < limits.MinTapInterval then
+		return fail("TooFast")
+	end
+
+	local ratedAt =
+		math.clamp(claimed, arrival - limits.LagAllowance, arrival + limits.ClockTolerance)
+	if ratedAt < segment.StartAt - limits.ClockTolerance then
+		-- The marker was not moving yet: still waiting to start, or paused
+		-- after the previous hit.
+		return fail(if segment.Hit == 1 then "NotStarted" else "TooFast")
+	end
+	ratedAt = math.max(ratedAt, segment.StartAt)
+
+	local setup = state.Setup
+	local position, direction = ExtractionMath.positionAt(segment, ratedAt)
+	local rating, points =
+		ExtractionMath.rate(position, setup.Zones[segment.Hit], setup.PerfectWidth, setup.GoodWidth)
+	table.insert(state.Ratings, rating)
+	table.insert(state.Points, points)
+	state.LastArrival = arrival
+
+	local nextHit = segment.Hit + 1
+	if nextHit > setup.Hits then
+		state.Finished = true
+		state.Segment = nil
+	else
+		state.Segment = {
+			Hit = nextHit,
+			StartAt = ratedAt + setup.HitPause,
+			StartPos = position,
+			StartDir = direction,
+			Speed = setup.Speeds[nextHit],
+		}
+	end
+
+	return {
+		Ok = true,
+		Code = rating,
+		Hit = segment.Hit,
+		Rating = rating,
+		Position = position,
+		RatedAt = ratedAt,
+	}
+end
+
+-- Time ran out: every hit not taken counts as the worst possible miss.
+-- The fossil is still extracted.
+function ExtractionRules.expire(state: State)
+	if state.Finished then
+		return
+	end
+	local worst = ExtractionConfig.Condition.Miss.Min
+	while #state.Ratings < state.Setup.Hits do
+		table.insert(state.Ratings, "Miss")
+		table.insert(state.Points, worst)
+	end
+	state.Finished = true
+	state.TimedOut = true
+	state.Segment = nil
+end
+
+-- The fossil's condition (1-100) from the hits so far.
+function ExtractionRules.condition(state: State): number
+	return ExtractionMath.condition(state.Points)
+end
+
+return ExtractionRules
+]]></string>
+          </Properties>
+        </Item>
+      </Item>
+      <Item class="Script" referent="32">
         <Properties>
           <string name="Name">Main</string>
           <token name="RunContext">0</token>
@@ -1643,17 +2510,27 @@ local Remotes = require(ReplicatedStorage.Shared.Remotes)
 Remotes.createAll()
 
 local Services = script.Parent.Services
+local AnalyticsService = require(Services.AnalyticsService)
+local DataService = require(Services.DataService)
 local DebugService = require(Services.DebugService)
 local DigService = require(Services.DigService)
+local ExtractionService = require(Services.ExtractionService)
 local FossilService = require(Services.FossilService)
+local InventoryService = require(Services.InventoryService)
 local PlotService = require(Services.PlotService)
 local ToolService = require(Services.ToolService)
 
--- Later milestones add MuseumService, EconomyService and DataService here.
+-- DataService starts first, so a joining player's data exists before any
+-- other service handles them. Later milestones add MuseumService and
+-- EconomyService here.
 local services: { any } = {
+	DataService,
+	AnalyticsService,
 	PlotService,
 	FossilService,
 	ToolService,
+	InventoryService,
+	ExtractionService,
 	DigService,
 	DebugService,
 }
@@ -1672,11 +2549,192 @@ end
 ]]></string>
         </Properties>
       </Item>
-      <Item class="Folder" referent="25">
+      <Item class="Folder" referent="33">
         <Properties>
           <string name="Name">Services</string>
         </Properties>
-        <Item class="ModuleScript" referent="26">
+        <Item class="ModuleScript" referent="34">
+          <Properties>
+            <string name="Name">AnalyticsService</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	AnalyticsService: a small, safe wrapper around Roblox's AnalyticsService.
+
+	Game code calls this module, never the engine service directly, so:
+	  * a failing or unavailable analytics call can never break gameplay
+	    (every engine call is wrapped in pcall)
+	  * nothing is sent from Studio unless AnalyticsConfig.SendInStudio is on;
+	    events are printed to the Output instead
+	  * each onboarding step is logged at most once per player per session
+
+	Onboarding steps are listed in AnalyticsConfig.OnboardingSteps.
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local AnalyticsConfig = require(ReplicatedStorage.Shared.Config.AnalyticsConfig)
+
+local AnalyticsService = {}
+
+-- Steps logged so far for each player, in the order they were logged.
+local logged: { [Player]: { string } } = {}
+
+local function engine(): any
+	local ok, service = pcall(function()
+		return game:GetService("AnalyticsService")
+	end)
+	return if ok then service else nil
+end
+
+local function stepNumber(stepName: string): number?
+	return table.find(AnalyticsConfig.OnboardingSteps, stepName)
+end
+
+-- Sends one call to the engine, or prints it in Studio. Never throws.
+local function send(description: string, call: (service: any) -> ())
+	if RunService:IsStudio() and not AnalyticsConfig.SendInStudio then
+		if AnalyticsConfig.PrintInStudio then
+			print(`[Analytics] {description}`)
+		end
+		return
+	end
+	local service = engine()
+	if service == nil then
+		return
+	end
+	local ok, err = pcall(call, service)
+	if not ok then
+		warn(`[Analytics] {description} failed: {err}`)
+	end
+end
+
+-- Logs an onboarding funnel step (a name from AnalyticsConfig.OnboardingSteps)
+-- the first time this player reaches it. Later calls do nothing.
+function AnalyticsService.LogOnboardingStep(player: Player, stepName: string)
+	local step = stepNumber(stepName)
+	if step == nil then
+		warn(`[Analytics] Unknown onboarding step "{stepName}"`)
+		return
+	end
+	local history = logged[player]
+	if history == nil then
+		history = {}
+		logged[player] = history
+	end
+	if table.find(history, stepName) then
+		return
+	end
+	table.insert(history, stepName)
+	send(`{player.Name} onboarding step {step} {stepName}`, function(service: any)
+		service:LogOnboardingFunnelStepEvent(player, step, stepName)
+	end)
+end
+
+-- The steps this player has reached, in order (a copy).
+function AnalyticsService.GetLoggedSteps(player: Player): { string }
+	local history = logged[player]
+	return if history then table.clone(history) else {}
+end
+
+function AnalyticsService.Start()
+	local function onPlayerAdded(player: Player)
+		AnalyticsService.LogOnboardingStep(player, "Joined")
+	end
+	Players.PlayerAdded:Connect(onPlayerAdded)
+	Players.PlayerRemoving:Connect(function(player: Player)
+		logged[player] = nil
+	end)
+	for _, player in Players:GetPlayers() do
+		task.spawn(onPlayerAdded, player)
+	end
+end
+
+return AnalyticsService
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="35">
+          <Properties>
+            <string name="Name">DataService</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	DataService: where each player's data lives while they are in the game.
+
+	This is the ONLY module that knows how player data is stored. Everything
+	else (InventoryService, and later the museum and upgrades) asks
+	DataService.Get(player) and changes the table it gets back.
+
+	Milestone 2: data is kept in memory only. It starts from TEMPLATE when a
+	player joins and is thrown away when they leave, so the inventory resets
+	on rejoin.
+
+	Milestone 4: swap the inside of this module for ProfileStore. Load the
+	profile on join (using TEMPLATE as its template), return profile.Data from
+	Get, and end the session on leave. Get may then return nil for a moment
+	while a profile loads, which callers already handle.
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local InventoryLogic = require(ReplicatedStorage.Shared.Inventory.InventoryLogic)
+
+export type PlayerData = {
+	Inventory: { InventoryLogic.Entry },
+	NextEntryId: number, -- id for the next inventory entry; ids are never reused
+}
+
+local DataService = {}
+
+-- A brand-new player's data. Add new fields here with a sensible default.
+local TEMPLATE: PlayerData = {
+	Inventory = {},
+	NextEntryId = 1,
+}
+
+local loaded: { [Player]: PlayerData } = {}
+
+local function deepCopy<T>(value: T): T
+	if typeof(value) ~= "table" then
+		return value
+	end
+	local copy = {}
+	for key, child in value :: any do
+		copy[key] = deepCopy(child)
+	end
+	return copy :: any
+end
+
+local function load(player: Player)
+	if loaded[player] == nil then
+		loaded[player] = deepCopy(TEMPLATE)
+	end
+end
+
+local function release(player: Player)
+	loaded[player] = nil
+end
+
+-- The player's data, or nil if it is not loaded (yet, or any more).
+function DataService.Get(player: Player): PlayerData?
+	return loaded[player]
+end
+
+function DataService.Start()
+	Players.PlayerAdded:Connect(load)
+	Players.PlayerRemoving:Connect(release)
+	for _, player in Players:GetPlayers() do
+		load(player)
+	end
+end
+
+return DataService
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="36">
           <Properties>
             <string name="Name">DebugService</string>
             <string name="Source"><![CDATA[--!strict
@@ -1746,7 +2804,7 @@ return DebugService
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="27">
+        <Item class="ModuleScript" referent="37">
           <Properties>
             <string name="Name">DigService</string>
             <string name="Source"><![CDATA[--!strict
@@ -1759,13 +2817,15 @@ return DebugService
 
 	  1. the request is well formed (right types, a real cell number)
 	  2. the player is not flooding the remote
-	  3. the player has a plot, a living character and a tool in hand
-	  4. the tool's cooldown has passed
-	  5. the character is close enough to the cell
-	  6. the cell can be hit: it exists, is exposed, and the tool affects it
+	  3. the player has a plot and is not in the middle of an extraction
+	  4. the player has a living character and a tool in hand
+	  5. the tool's cooldown has passed
+	  6. the character is close enough to the cell
+	  7. the cell can be hit: it exists, is exposed, and the tool affects it
 
 	Only then does it change the plot, and it always answers with SwingResult
-	so the client can correct its prediction.
+	so the client can correct its prediction. The swing that uncovers a
+	fossil also starts its extraction (ExtractionService).
 ]]
 
 local Players = game:GetService("Players")
@@ -1779,6 +2839,8 @@ local Remotes = require(Shared.Remotes)
 local ToolConfig = require(Shared.Config.ToolConfig)
 
 local Server = script.Parent.Parent
+local AnalyticsService = require(script.Parent.AnalyticsService)
+local ExtractionService = require(script.Parent.ExtractionService)
 local FossilService = require(script.Parent.FossilService)
 local PlotRules = require(Server.Dig.PlotRules)
 local PlotService = require(script.Parent.PlotService)
@@ -1792,25 +2854,32 @@ local limiter = RateLimiter.new(DigConfig.MaxRequestsPerSecond, DigConfig.Reques
 -- The earliest time each player's next swing is due.
 local nextSwingAt: { [Player]: number } = {}
 
--- Decides one swing. Returns ok, code, value, defId (see Remotes).
-local function resolve(player: Player, cellIndex: number): (boolean, string, number, string?)
+-- Decides one swing. Returns ok, code, value, defId (see Remotes), and the
+-- index of the fossil this swing uncovered, if it uncovered one.
+local function resolve(
+	player: Player,
+	cellIndex: number
+): (boolean, string, number, string?, number?)
 	local plot = PlotService.GetPlot(player)
 	local state = plot and plot.State
 	if plot == nil or state == nil then
-		return false, "NoPlot", 0, nil
+		return false, "NoPlot", 0, nil, nil
+	end
+	if ExtractionService.IsActive(player) then
+		return false, "Extracting", 0, nil, nil
 	end
 
 	local toolId = ToolService.GetEquipped(player)
 	local tool = toolId and ToolConfig.Tools[toolId]
 	if toolId == nil or tool == nil then
-		return false, "NoTool", 0, nil
+		return false, "NoTool", 0, nil, nil
 	end
 
 	local character = player.Character
 	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
 	local root = character and character:FindFirstChild("HumanoidRootPart")
 	if humanoid == nil or humanoid.Health <= 0 or root == nil or not root:IsA("BasePart") then
-		return false, "NoCharacter", 0, nil
+		return false, "NoCharacter", 0, nil, nil
 	end
 
 	-- Cooldown. A swing may arrive a little early (network jitter), but each
@@ -1819,14 +2888,14 @@ local function resolve(player: Player, cellIndex: number): (boolean, string, num
 	local now = os.clock()
 	local dueAt = nextSwingAt[player] or 0
 	if now < dueAt - DigConfig.CooldownTolerance then
-		return false, "Cooldown", 0, nil
+		return false, "Cooldown", 0, nil, nil
 	end
 
 	-- Reach, measured by the server from where it sees the character.
 	local cellCenter = PlotService.GetCellCenter(plot, cellIndex)
 	local distance = DigRules.distanceToCell(root.Position, cellCenter)
 	if distance > tool.Range + DigConfig.RangeTolerance then
-		return false, "TooFar", 0, nil
+		return false, "TooFar", 0, nil, nil
 	end
 
 	local outcome = PlotRules.resolveSwing(state, cellIndex, toolId)
@@ -1836,6 +2905,7 @@ local function resolve(player: Player, cellIndex: number): (boolean, string, num
 	end
 
 	local defId: string? = nil
+	local uncovered: number? = nil
 	if outcome.Code == "Hit" then
 		PlotService.SetCellHealth(plot, cellIndex, outcome.Value)
 	elseif outcome.Code == "Break" then
@@ -1847,9 +2917,16 @@ local function resolve(player: Player, cellIndex: number): (boolean, string, num
 		FossilService.SetClean(plot, outcome.FossilIndex, outcome.Value)
 	elseif outcome.Code == "Reveal" and outcome.FossilIndex then
 		defId = FossilService.Reveal(plot, outcome.FossilIndex)
+		uncovered = outcome.FossilIndex
 	end
 
-	return outcome.Ok, outcome.Code, outcome.Value, defId
+	if outcome.Ok then
+		AnalyticsService.LogOnboardingStep(player, "FirstSwing")
+	end
+	if uncovered then
+		AnalyticsService.LogOnboardingStep(player, "FirstFossilUncovered")
+	end
+	return outcome.Ok, outcome.Code, outcome.Value, defId, uncovered
 end
 
 -- Client -> server. Every argument is untrusted.
@@ -1867,8 +2944,15 @@ local function onSwingRequest(player: Player, seq: any, cellIndex: any)
 		return
 	end
 
-	local ok, code, value, defId = resolve(player, cellIndex)
+	local ok, code, value, defId, uncovered = resolve(player, cellIndex)
 	Remotes.get("SwingResult"):FireClient(player, seq, ok, code, value, defId)
+
+	-- Answer the swing first, so the client confirms the reveal before the
+	-- extraction arrives.
+	local plot = PlotService.GetPlot(player)
+	if uncovered and plot then
+		ExtractionService.Begin(player, plot, uncovered)
+	end
 end
 
 function DigService.Start()
@@ -1883,7 +2967,265 @@ return DigService
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="28">
+        <Item class="ModuleScript" referent="38">
+          <Properties>
+            <string name="Name">ExtractionService</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	ExtractionService: runs the extraction minigame for each player.
+
+	Uncovering a fossil (the final brush stroke) calls Begin. The server then:
+	  1. sets up the extraction (ExtractionRules.new): marker speeds, start
+	     position, zones and start time are all chosen here
+	  2. tells the player with ExtractionStarted
+	  3. rates each ExtractionTap (the client only sends WHEN it tapped)
+	  4. once every hit is rated, or time runs out, works out the condition,
+	     adds the fossil to the inventory and sends ExtractionFinished
+
+	A player has at most one extraction at a time, and a fossil can only ever
+	be extracted once. While a player is extracting, DigService refuses their
+	swings, and their plot's refill waits (PlotService.SetRefillHeld).
+
+	Every ExtractionTap is checked, in order:
+	  1. well formed: a whole-number id and a finite timestamp
+	  2. not flooding (rate limit, as in DigService)
+	  3. the id is this player's own running extraction
+	  4. the rules (ExtractionRules.tap): not finished (extra taps), not too
+	     fast, the marker is moving
+	and always answered with ExtractionTapResult, so the client can correct
+	its prediction.
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+
+local Shared = ReplicatedStorage.Shared
+local ExtractionConfig = require(Shared.Config.ExtractionConfig)
+local ExtractionMath = require(Shared.Extraction.ExtractionMath)
+local FossilConfig = require(Shared.Config.FossilConfig)
+local Remotes = require(Shared.Remotes)
+
+local Server = script.Parent.Parent
+local AnalyticsService = require(script.Parent.AnalyticsService)
+local ExtractionRules = require(Server.Extraction.ExtractionRules)
+local FossilService = require(script.Parent.FossilService)
+local InventoryService = require(script.Parent.InventoryService)
+local PlotService = require(script.Parent.PlotService)
+local RateLimiter = require(Server.Util.RateLimiter)
+
+export type Extraction = {
+	Id: number,
+	Player: Player,
+	Plot: PlotService.Plot,
+	FossilIndex: number,
+	CellIndex: number,
+	Generation: number, -- the plot's generation when the fossil was uncovered
+	FossilId: string,
+	FoundAt: number, -- os.time()
+	State: ExtractionRules.State,
+}
+
+local ExtractionService = {}
+
+local limits = ExtractionConfig.Server
+local limiter = RateLimiter.new(limits.MaxRequestsPerSecond, limits.RequestBurst)
+local random = Random.new()
+
+local byPlayer: { [Player]: Extraction } = {}
+local byId: { [number]: Extraction } = {}
+local lastId = 0
+
+local function segmentPayload(segment: ExtractionMath.Segment?): { [string]: number }?
+	if segment == nil then
+		return nil
+	end
+	return {
+		Hit = segment.Hit,
+		StartAt = segment.StartAt,
+		StartPos = segment.StartPos,
+		StartDir = segment.StartDir,
+		Speed = segment.Speed,
+	}
+end
+
+-- What the client needs to draw and predict the minigame.
+local function startPayload(extraction: Extraction): { [string]: any }
+	local setup = extraction.State.Setup
+	return {
+		FossilId = extraction.FossilId,
+		Rarity = setup.Rarity,
+		CellIndex = extraction.CellIndex,
+		Hits = setup.Hits,
+		StartAt = setup.StartAt,
+		Deadline = setup.Deadline,
+		Speeds = table.clone(setup.Speeds),
+		StartPos = setup.StartPos,
+		StartDir = setup.StartDir,
+		Zones = table.clone(setup.Zones),
+		PerfectWidth = setup.PerfectWidth,
+		GoodWidth = setup.GoodWidth,
+		HitPause = setup.HitPause,
+	}
+end
+
+local function forget(extraction: Extraction)
+	if byPlayer[extraction.Player] == extraction then
+		byPlayer[extraction.Player] = nil
+	end
+	byId[extraction.Id] = nil
+	PlotService.SetRefillHeld(extraction.Plot, false)
+end
+
+-- Every hit is rated (or time ran out): the fossil goes into the inventory.
+local function finish(extraction: Extraction)
+	if byId[extraction.Id] ~= extraction then
+		return
+	end
+	local player = extraction.Player
+	local state = extraction.State
+	local condition = ExtractionRules.condition(state)
+	forget(extraction)
+
+	local entry = InventoryService.Add(player, extraction.FossilId, condition, extraction.FoundAt)
+	FossilService.MarkExtracted(
+		extraction.Plot,
+		extraction.FossilIndex,
+		extraction.Generation,
+		limits.RemovePartDelay
+	)
+	AnalyticsService.LogOnboardingStep(player, "FirstExtraction")
+
+	Remotes.get("ExtractionFinished"):FireClient(player, extraction.Id, {
+		EntryId = if entry then entry.Id else 0,
+		FossilId = extraction.FossilId,
+		Rarity = state.Setup.Rarity,
+		Condition = condition,
+		Ratings = table.clone(state.Ratings),
+		TimedOut = state.TimedOut,
+	})
+end
+
+-- Starts extracting a fossil the player has just uncovered. Returns false if
+-- it cannot start (the player is already extracting, the fossil is not
+-- uncovered, or it has been extracted before).
+function ExtractionService.Begin(
+	player: Player,
+	plot: PlotService.Plot,
+	fossilIndex: number
+): boolean
+	local state = plot.State
+	local fossil = state and state.Fossils[fossilIndex]
+	if byPlayer[player] or plot.Owner ~= player or fossil == nil then
+		return false
+	end
+	if fossil.Stage ~= "Revealed" or fossil.ExtractionStarted then
+		return false
+	end
+	local def = FossilConfig.ById[fossil.DefId]
+	if def == nil then
+		return false
+	end
+	fossil.ExtractionStarted = true
+
+	lastId += 1
+	local now = Workspace:GetServerTimeNow()
+	local extraction: Extraction = {
+		Id = lastId,
+		Player = player,
+		Plot = plot,
+		FossilIndex = fossilIndex,
+		CellIndex = fossil.CellIndex,
+		Generation = plot.Generation,
+		FossilId = def.Id,
+		FoundAt = os.time(),
+		State = ExtractionRules.new(def.Rarity, now, function(): number
+			return random:NextNumber()
+		end),
+	}
+	byPlayer[player] = extraction
+	byId[extraction.Id] = extraction
+	PlotService.SetRefillHeld(plot, true)
+
+	Remotes.get("ExtractionStarted"):FireClient(player, extraction.Id, startPayload(extraction))
+
+	-- A player who walks away still gets the fossil once time runs out.
+	task.delay(extraction.State.Setup.Deadline - now, function()
+		if byId[extraction.Id] == extraction then
+			ExtractionRules.expire(extraction.State)
+			finish(extraction)
+		end
+	end)
+	return true
+end
+
+-- True while the player has an extraction running.
+function ExtractionService.IsActive(player: Player): boolean
+	return byPlayer[player] ~= nil
+end
+
+-- The player's running extraction, or nil (for debugging and tests).
+function ExtractionService.GetActive(player: Player): Extraction?
+	return byPlayer[player]
+end
+
+local function reply(player: Player, id: number, result: { [string]: any })
+	Remotes.get("ExtractionTapResult"):FireClient(player, id, result)
+end
+
+-- Client -> server. Every argument is untrusted.
+local function onExtractionTap(player: Player, id: any, claimed: any)
+	if typeof(id) ~= "number" or typeof(claimed) ~= "number" then
+		return
+	end
+	if id ~= id or id % 1 ~= 0 or claimed ~= claimed or math.abs(claimed) == math.huge then
+		return
+	end
+	if not limiter:allow(player) then
+		return
+	end
+
+	local extraction = byId[id]
+	if extraction == nil or extraction.Player ~= player then
+		-- Not this player's (or long finished). Say nothing about it.
+		reply(player, id, { Ok = false, Code = "NotYours" })
+		return
+	end
+
+	local state = extraction.State
+	local outcome = ExtractionRules.tap(state, claimed, Workspace:GetServerTimeNow())
+	reply(player, id, {
+		Ok = outcome.Ok,
+		Code = outcome.Code,
+		Hit = outcome.Hit,
+		Rating = outcome.Rating,
+		Position = outcome.Position,
+		RatedAt = outcome.RatedAt,
+		Done = #state.Ratings,
+		Next = segmentPayload(state.Segment),
+	})
+	if state.Finished then
+		finish(extraction)
+	end
+end
+
+function ExtractionService.Start()
+	Remotes.get("ExtractionTap").OnServerEvent:Connect(onExtractionTap)
+	Players.PlayerRemoving:Connect(function(player: Player)
+		local extraction = byPlayer[player]
+		if extraction then
+			-- No saving yet, so an unfinished extraction is simply dropped.
+			forget(extraction)
+		end
+		limiter:forget(player)
+	end)
+end
+
+return ExtractionService
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="39">
           <Properties>
             <string name="Name">FossilService</string>
             <string name="Source"><![CDATA[--!strict
@@ -1897,8 +3239,9 @@ return DigService
 
 	Which fossil it is (DefId) is only written onto the part at Revealed.
 
-	Milestone 2 picks up from here: a Revealed fossil is what the extraction
-	minigame will start from.
+	Revealing a fossil starts the extraction minigame (ExtractionService).
+	Once it is extracted the fossil goes into the inventory, the part's Stage
+	attribute becomes "Extracted", and the part is removed shortly after.
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -2003,6 +3346,31 @@ function FossilService.Reveal(plot: PlotService.Plot, fossilIndex: number): stri
 	return def.Id
 end
 
+-- The fossil has been extracted into the player's inventory. Its part stays
+-- for `removeDelay` seconds so the client can animate it away, then goes.
+-- Does nothing if the plot has been reseeded since (`generation` is stale).
+function FossilService.MarkExtracted(
+	plot: PlotService.Plot,
+	fossilIndex: number,
+	generation: number,
+	removeDelay: number
+)
+	if plot.Generation ~= generation then
+		return
+	end
+	local part = plot.FossilParts[fossilIndex]
+	if part == nil then
+		return
+	end
+	part:SetAttribute("Stage", "Extracted")
+	task.delay(removeDelay, function()
+		if plot.Generation == generation and plot.FossilParts[fossilIndex] == part then
+			plot.FossilParts[fossilIndex] = nil
+			part:Destroy()
+		end
+	end)
+end
+
 -- Cell indices of the fossils that are still not uncovered (debug only).
 function FossilService.GetHiddenCells(plot: PlotService.Plot): { number }
 	local result: { number } = {}
@@ -2021,7 +3389,118 @@ return FossilService
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="29">
+        <Item class="ModuleScript" referent="40">
+          <Properties>
+            <string name="Name">InventoryService</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	InventoryService: every fossil a player has extracted.
+
+	The inventory is a list of entries (see InventoryLogic.Entry), one per find,
+	kept in the player's data (DataService). The server owns it; clients get a
+	copy and are told about every change:
+
+	  InventoryRequest   client asks for the whole list (once, when it starts)
+	  InventorySync      server sends the whole list
+	  InventoryAdded     server sends one new entry
+
+	Milestone 3 adds removing entries (placing in the museum, selling).
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Shared = ReplicatedStorage.Shared
+local FossilConfig = require(Shared.Config.FossilConfig)
+local InventoryLogic = require(Shared.Inventory.InventoryLogic)
+local Remotes = require(Shared.Remotes)
+
+local DataService = require(script.Parent.DataService)
+local RateLimiter = require(script.Parent.Parent.Util.RateLimiter)
+
+local InventoryService = {}
+
+local limiter = RateLimiter.new(1, 3)
+
+local function copyList(entries: { InventoryLogic.Entry }): { InventoryLogic.Entry }
+	local copy: { InventoryLogic.Entry } = {}
+	for index, entry in entries do
+		copy[index] = InventoryLogic.copyEntry(entry)
+	end
+	return copy
+end
+
+-- Adds one find. Returns a copy of the new entry, or nil if the fossil is
+-- unknown or the player's data is not loaded.
+--   condition  1-100 (rounded and clamped here)
+--   foundAt    os.time() when the fossil was uncovered
+function InventoryService.Add(
+	player: Player,
+	fossilId: string,
+	condition: number,
+	foundAt: number
+): InventoryLogic.Entry?
+	local def = FossilConfig.ById[fossilId]
+	local data = DataService.Get(player)
+	if def == nil or data == nil then
+		warn(`[InventoryService] Could not add {fossilId} for {player.Name}`)
+		return nil
+	end
+	local entry: InventoryLogic.Entry = {
+		Id = data.NextEntryId,
+		FossilId = def.Id,
+		Rarity = def.Rarity,
+		Condition = math.clamp(math.round(condition), 1, 100),
+		FoundAt = math.floor(foundAt),
+	}
+	data.NextEntryId += 1
+	table.insert(data.Inventory, entry)
+	Remotes.get("InventoryAdded"):FireClient(player, InventoryLogic.copyEntry(entry))
+	return InventoryLogic.copyEntry(entry)
+end
+
+-- A copy of every entry, in the order they were found.
+function InventoryService.GetEntries(player: Player): { InventoryLogic.Entry }
+	local data = DataService.Get(player)
+	return if data then copyList(data.Inventory) else {}
+end
+
+-- A copy of every entry, sorted for display (rarest, then best condition).
+function InventoryService.GetSorted(player: Player): { InventoryLogic.Entry }
+	return InventoryLogic.sorted(InventoryService.GetEntries(player))
+end
+
+function InventoryService.GetSetProgress(player: Player, setId: string): InventoryLogic.SetProgress?
+	return InventoryLogic.setProgress(InventoryService.GetEntries(player), setId)
+end
+
+-- Sends the whole list to the player.
+function InventoryService.Sync(player: Player)
+	local data = DataService.Get(player)
+	if data then
+		Remotes.get("InventorySync"):FireClient(player, copyList(data.Inventory))
+	end
+end
+
+-- Client -> server. Takes no arguments; anything sent is ignored.
+local function onInventoryRequest(player: Player)
+	if limiter:allow(player) then
+		InventoryService.Sync(player)
+	end
+end
+
+function InventoryService.Start()
+	Remotes.get("InventoryRequest").OnServerEvent:Connect(onInventoryRequest)
+	Players.PlayerRemoving:Connect(function(player: Player)
+		limiter:forget(player)
+	end)
+end
+
+return InventoryService
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="41">
           <Properties>
             <string name="Name">PlotService</string>
             <string name="Source"><![CDATA[--!strict
@@ -2074,6 +3553,8 @@ export type Plot = {
 	Dressed: { [number]: boolean }, -- cells that already show their hint
 	Generation: number, -- goes up by one every time the plot is reseeded
 	RefillToken: number, -- cancels a scheduled refill when it changes
+	RefillHeld: boolean, -- true while an extraction is running (see SetRefillHeld)
+	RefillPending: boolean, -- a refill came due while held; it runs once released
 }
 
 local PlotService = {}
@@ -2182,6 +3663,7 @@ end
 
 local function clearGrid(plot: Plot)
 	plot.RefillToken += 1
+	plot.RefillPending = false
 	plot.State = nil
 	plot.CellsFolder:ClearAllChildren()
 	plot.FossilsFolder:ClearAllChildren()
@@ -2297,6 +3779,7 @@ local function release(player: Player)
 	end
 	plotByPlayer[player] = nil
 	plot.Owner = nil
+	plot.RefillHeld = false
 	clearGrid(plot)
 	plot.Cover.Parent = plot.Model:FindFirstChild("Ground")
 	local model = plot.Model
@@ -2346,17 +3829,35 @@ function PlotService.Regenerate(plot: Plot)
 	generate(plot)
 end
 
--- Refills and reseeds the plot after GridConfig.RefillDelay seconds.
-function PlotService.ScheduleRefill(plot: Plot)
+-- Refills and reseeds the plot after `delay` seconds (GridConfig.RefillDelay
+-- by default). If the refill is held when it comes due, it waits for the release.
+function PlotService.ScheduleRefill(plot: Plot, delay: number?)
 	plot.RefillToken += 1
 	local token = plot.RefillToken
-	local delay = GridConfig.RefillDelay
-	plot.Model:SetAttribute("RefillAt", Workspace:GetServerTimeNow() + delay)
-	task.delay(delay, function()
-		if plot.RefillToken == token and plot.Owner ~= nil then
+	local seconds = delay or GridConfig.RefillDelay
+	plot.Model:SetAttribute("RefillAt", Workspace:GetServerTimeNow() + seconds)
+	task.delay(seconds, function()
+		if plot.RefillToken ~= token or plot.Owner == nil then
+			return
+		end
+		if plot.RefillHeld then
+			plot.RefillPending = true
+			plot.Model:SetAttribute("RefillAt", 0)
+		else
 			generate(plot)
 		end
 	end)
+end
+
+-- While held, a refill that comes due waits instead of running, so the ground
+-- never refills under a fossil the player is still extracting. On release, a
+-- waiting refill runs GridConfig.RefillDelayAfterExtraction seconds later.
+function PlotService.SetRefillHeld(plot: Plot, held: boolean)
+	plot.RefillHeld = held
+	if not held and plot.RefillPending then
+		plot.RefillPending = false
+		PlotService.ScheduleRefill(plot, GridConfig.RefillDelayAfterExtraction)
+	end
 end
 
 function PlotService.Init()
@@ -2376,6 +3877,8 @@ function PlotService.Init()
 			Dressed = {},
 			Generation = 0,
 			RefillToken = 0,
+			RefillHeld = false,
+			RefillPending = false,
 		})
 	end
 end
@@ -2392,7 +3895,7 @@ return PlotService
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="30">
+        <Item class="ModuleScript" referent="42">
           <Properties>
             <string name="Name">ToolService</string>
             <string name="Source"><![CDATA[--!strict
@@ -2578,11 +4081,11 @@ return ToolService
           </Properties>
         </Item>
       </Item>
-      <Item class="Folder" referent="31">
+      <Item class="Folder" referent="43">
         <Properties>
           <string name="Name">Util</string>
         </Properties>
-        <Item class="ModuleScript" referent="32">
+        <Item class="ModuleScript" referent="44">
           <Properties>
             <string name="Name">RateLimiter</string>
             <string name="Source"><![CDATA[--!strict
@@ -2646,11 +4149,11 @@ return RateLimiter
           </Properties>
         </Item>
       </Item>
-      <Item class="Folder" referent="33">
+      <Item class="Folder" referent="45">
         <Properties>
           <string name="Name">World</string>
         </Properties>
-        <Item class="ModuleScript" referent="34">
+        <Item class="ModuleScript" referent="46">
           <Properties>
             <string name="Name">WorldBuilder</string>
             <string name="Source"><![CDATA[--!strict
@@ -2943,23 +4446,23 @@ return WorldBuilder
       </Item>
     </Item>
   </Item>
-  <Item class="StarterPlayer" referent="35">
+  <Item class="StarterPlayer" referent="47">
     <Properties>
       <string name="Name">StarterPlayer</string>
     </Properties>
-    <Item class="StarterPlayerScripts" referent="36">
+    <Item class="StarterPlayerScripts" referent="48">
       <Properties>
         <string name="Name">StarterPlayerScripts</string>
       </Properties>
-      <Item class="Folder" referent="37">
+      <Item class="Folder" referent="49">
         <Properties>
           <string name="Name">Client</string>
         </Properties>
-        <Item class="Folder" referent="38">
+        <Item class="Folder" referent="50">
           <Properties>
             <string name="Name">Controllers</string>
           </Properties>
-          <Item class="ModuleScript" referent="39">
+          <Item class="ModuleScript" referent="51">
             <Properties>
               <string name="Name">DebugController</string>
               <string name="Source"><![CDATA[--!strict
@@ -3074,7 +4577,7 @@ return DebugController
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="40">
+          <Item class="ModuleScript" referent="52">
             <Properties>
               <string name="Name">DigController</string>
               <string name="Source"><![CDATA[--!strict
@@ -3091,6 +4594,9 @@ return DebugController
 	What the client does NOT do: decide anything. The server re-checks the
 	swing and answers with SwingResult. If it disagrees (rare: lag, or a
 	tampered client), the prediction is undone here.
+
+	Digging pauses during the reveal moment and while a fossil is being
+	extracted (the server refuses swings then too).
 
 	Controls: left click (hold to keep swinging) on PC, tap on mobile.
 ]]
@@ -3112,6 +4618,7 @@ local ToolConfig = require(Shared.Config.ToolConfig)
 local Client = script.Parent.Parent
 local CellVisuals = require(Client.Effects.CellVisuals)
 local EffectsController = require(script.Parent.EffectsController)
+local ExtractionController = require(script.Parent.ExtractionController)
 local FossilController = require(script.Parent.FossilController)
 local PlotController = require(script.Parent.PlotController)
 local ToolController = require(script.Parent.ToolController)
@@ -3266,7 +4773,7 @@ end
 -- One swing attempt along a ray from the camera.
 local function trySwing(origin: Vector3, direction: Vector3)
 	local now = os.clock()
-	if now < nextSwingAt or FossilController.isBusy() then
+	if now < nextSwingAt or FossilController.isBusy() or ExtractionController.isBusy() then
 		return
 	end
 
@@ -3406,6 +4913,10 @@ local function updateHover()
 	if not FeelConfig.Hover.Enabled then
 		return
 	end
+	if ExtractionController.isBusy() then
+		EffectsController.setHover(nil, nil)
+		return
+	end
 	local camera = Workspace.CurrentCamera
 	if
 		camera == nil
@@ -3513,7 +5024,7 @@ return DigController
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="41">
+          <Item class="ModuleScript" referent="53">
             <Properties>
               <string name="Name">EffectsController</string>
               <string name="Source"><![CDATA[--!strict
@@ -3715,7 +5226,565 @@ return EffectsController
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="42">
+          <Item class="ModuleScript" referent="54">
+            <Properties>
+              <string name="Name">ExtractionController</string>
+              <string name="Source"><![CDATA[--!strict
+--[[
+	ExtractionController: the extraction minigame on this client.
+
+	The server starts it (ExtractionStarted) the moment a fossil is uncovered,
+	and sends everything needed to draw it: the marker's speeds, start and
+	direction, each hit's zone, and when the marker sets off (in server time).
+	The client draws the marker from Workspace:GetServerTimeNow(), so what the
+	player sees matches what the server will rate.
+
+	On each tap:
+	  1. PREDICT the rating with the same maths the server uses (ExtractionMath)
+	     and play the feedback at once: a crisp sound and flash for Perfect, a
+	     softer sound for Good, a dull thunk and a shake for Miss.
+	  2. Send the server only the moment of the tap (ExtractionTap).
+	  3. The server answers with its own rating (ExtractionTapResult). It
+	     normally agrees; if not, the pip is corrected. A refused tap is undone.
+	When the server sends ExtractionFinished, the "Extracted!" moment plays:
+	the fossil's name in its rarity colour and its condition, e.g.
+	"Ammonite: Excellent, 87%", and the fossil flies off into the collection.
+
+	Only one tap is ever waiting for an answer, which keeps the prediction
+	simple to correct. Digging is paused while an extraction runs (DigController
+	asks isBusy()).
+
+	Controls: tap or click anywhere, or press Space (gamepad: A). Space is
+	taken over during extraction, so it does not make the character jump.
+]]
+
+local ContextActionService = game:GetService("ContextActionService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+
+local Shared = ReplicatedStorage.Shared
+local ExtractionConfig = require(Shared.Config.ExtractionConfig)
+local ExtractionMath = require(Shared.Extraction.ExtractionMath)
+local FossilConfig = require(Shared.Config.FossilConfig)
+local RarityConfig = require(Shared.Config.RarityConfig)
+local Remotes = require(Shared.Remotes)
+
+local Client = script.Parent.Parent
+local CameraFx = require(Client.Effects.CameraFx)
+local ExtractionView = require(Client.Ui.ExtractionView)
+local FossilController = require(script.Parent.FossilController)
+local InventoryController = require(script.Parent.InventoryController)
+local SoundPlayer = require(Client.Effects.SoundPlayer)
+
+-- What the server sent in ExtractionStarted, after checking.
+export type Info = {
+	FossilId: string,
+	Rarity: string,
+	CellIndex: number,
+	Hits: number,
+	StartAt: number,
+	Deadline: number,
+	Speeds: { number },
+	StartPos: number,
+	StartDir: number,
+	Zones: { number },
+	PerfectWidth: number,
+	GoodWidth: number,
+	HitPause: number,
+}
+
+export type Result = {
+	FossilId: string,
+	Rarity: string,
+	Condition: number,
+	Ratings: { string },
+	TimedOut: boolean,
+}
+
+type Active = {
+	Id: number,
+	Info: Info,
+	Segment: ExtractionMath.Segment?, -- what the marker is doing; nil once every hit is taken
+	Ratings: { string }, -- shown so far (predicted, then confirmed by the server)
+	AwaitingReply: boolean, -- a tap has been sent and not answered yet
+	FrozenUntil: number, -- server time; the marker is paused after a hit until then
+	FrozenPos: number,
+	Opened: boolean,
+	LastTapAt: number, -- os.clock() of the last tap sent
+	Result: Result?,
+	ResultShownAt: number, -- os.clock(); 0 = not shown yet
+	FinishedAt: number, -- os.clock() of the last hit; 0 = still playing
+}
+
+local ACTION_NAME = "ExtractionTap"
+local TAP_KEYS = { Enum.KeyCode.Space, Enum.KeyCode.ButtonA }
+
+local ExtractionController = {}
+
+local feel = ExtractionConfig.Feel
+local active: Active? = nil
+
+local function serverNow(): number
+	return Workspace:GetServerTimeNow()
+end
+
+local function isNumber(value: any): boolean
+	return typeof(value) == "number" and value == value and math.abs(value) ~= math.huge
+end
+
+local function numberList(value: any, count: number): { number }?
+	if typeof(value) ~= "table" then
+		return nil
+	end
+	local list: { number } = {}
+	for index = 1, count do
+		local item = value[index]
+		if not isNumber(item) then
+			return nil
+		end
+		list[index] = item
+	end
+	return list
+end
+
+-- Checks the server's ExtractionStarted payload.
+local function readInfo(raw: any): Info?
+	if typeof(raw) ~= "table" then
+		return nil
+	end
+	local hits = raw.Hits
+	if not isNumber(hits) or hits < 1 or hits > 10 or hits % 1 ~= 0 then
+		return nil
+	end
+	local fossilId, rarity = raw.FossilId, raw.Rarity
+	if typeof(fossilId) ~= "string" or FossilConfig.ById[fossilId] == nil then
+		return nil
+	end
+	if typeof(rarity) ~= "string" then
+		return nil
+	end
+	local speeds = numberList(raw.Speeds, hits)
+	local zones = numberList(raw.Zones, hits)
+	for _, key in { "CellIndex", "StartAt", "Deadline", "StartPos", "StartDir" } do
+		if not isNumber(raw[key]) then
+			return nil
+		end
+	end
+	for _, key in { "PerfectWidth", "GoodWidth", "HitPause" } do
+		if not isNumber(raw[key]) then
+			return nil
+		end
+	end
+	if speeds == nil or zones == nil then
+		return nil
+	end
+	return {
+		FossilId = fossilId,
+		Rarity = rarity,
+		CellIndex = raw.CellIndex,
+		Hits = hits,
+		StartAt = raw.StartAt,
+		Deadline = raw.Deadline,
+		Speeds = speeds,
+		StartPos = raw.StartPos,
+		StartDir = raw.StartDir,
+		Zones = zones,
+		PerfectWidth = raw.PerfectWidth,
+		GoodWidth = raw.GoodWidth,
+		HitPause = raw.HitPause,
+	}
+end
+
+local function readSegment(raw: any): ExtractionMath.Segment?
+	if typeof(raw) ~= "table" then
+		return nil
+	end
+	for _, key in { "Hit", "StartAt", "StartPos", "StartDir", "Speed" } do
+		if not isNumber(raw[key]) then
+			return nil
+		end
+	end
+	return {
+		Hit = raw.Hit,
+		StartAt = raw.StartAt,
+		StartPos = raw.StartPos,
+		StartDir = raw.StartDir,
+		Speed = raw.Speed,
+	}
+end
+
+local function rarityColor(rarity: string): Color3
+	local def = RarityConfig.Rarities[rarity]
+	return if def then def.Color else Color3.new(1, 1, 1)
+end
+
+-- "#RRGGBB", for RichText colour tags.
+local function hex(color: Color3): string
+	return string.format(
+		"#%02X%02X%02X",
+		math.round(color.R * 255),
+		math.round(color.G * 255),
+		math.round(color.B * 255)
+	)
+end
+
+local function displayName(fossilId: string): string
+	local def = FossilConfig.ById[fossilId]
+	return if def then def.DisplayName else fossilId
+end
+
+local function hintText(): string
+	if UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled then
+		return "Tap to stop the marker in the gold!"
+	end
+	return "Click or press Space to stop the marker in the gold!"
+end
+
+local function showZone(current: Active, hit: number)
+	local info = current.Info
+	local center = info.Zones[math.clamp(hit, 1, info.Hits)]
+	ExtractionView.setZone(center, info.PerfectWidth, info.GoodWidth)
+end
+
+local function bindKeys()
+	ContextActionService:BindActionAtPriority(
+		ACTION_NAME,
+		function(_name: string, state: Enum.UserInputState): Enum.ContextActionResult
+			if state == Enum.UserInputState.Begin then
+				ExtractionController.tap()
+			end
+			return Enum.ContextActionResult.Sink
+		end,
+		false,
+		Enum.ContextActionPriority.High.Value,
+		table.unpack(TAP_KEYS)
+	)
+end
+
+local function unbindKeys()
+	ContextActionService:UnbindAction(ACTION_NAME)
+end
+
+local function close()
+	if active == nil then
+		return
+	end
+	active = nil
+	unbindKeys()
+	ExtractionView.close()
+end
+
+local function open(current: Active)
+	current.Opened = true
+	local info = current.Info
+	local color = rarityColor(info.Rarity)
+	local title = `Extract the <font color="{hex(color)}">{displayName(info.FossilId)}</font>!`
+	ExtractionView.open(title, hintText(), color)
+	showZone(current, 1)
+	for index, rating in current.Ratings do
+		ExtractionView.setPip(index, rating)
+	end
+	SoundPlayer.play(feel.OpenSound)
+	bindKeys()
+end
+
+local function playFeedback(current: Active, rating: string, position: number)
+	local ratingFeel = feel.Ratings[rating]
+	if ratingFeel == nil then
+		return
+	end
+	SoundPlayer.play(ratingFeel.Sound)
+	CameraFx.shake(ratingFeel.Shake)
+	ExtractionView.feedback(rating, position)
+	FossilController.extractionHit(current.Info.CellIndex, rating)
+end
+
+local function showResult(current: Active, result: Result)
+	current.ResultShownAt = os.clock()
+	local color = rarityColor(result.Rarity)
+	local grade = ExtractionMath.grade(result.Condition)
+	local line = string.format(
+		'<font color="%s">%s</font>: <font color="%s">%s</font>, %d%%',
+		hex(color),
+		displayName(result.FossilId),
+		hex(grade.Color),
+		grade.Name,
+		result.Condition
+	)
+	local sub = table.concat(result.Ratings, "  ·  ")
+	if result.TimedOut then
+		sub = "Out of time! Added to your collection anyway."
+	end
+	ExtractionView.showResult(line, sub)
+	for index, rating in result.Ratings do
+		ExtractionView.setPip(index, rating)
+	end
+	SoundPlayer.play(feel.ExtractedSound)
+	CameraFx.shake(feel.ExtractedShake)
+	FossilController.collect(current.Info.CellIndex)
+	InventoryController.pulse()
+end
+
+-- One tap (click, touch or Space). Public so the input bindings and tests
+-- share one path.
+function ExtractionController.tap()
+	local current = active
+	if current == nil or not current.Opened then
+		return
+	end
+
+	-- During the "Extracted!" moment a tap closes it early.
+	if current.ResultShownAt > 0 then
+		if os.clock() - current.ResultShownAt >= feel.MinResultTime then
+			close()
+		end
+		return
+	end
+
+	local segment = current.Segment
+	local now = serverNow()
+	if segment == nil or current.AwaitingReply or now < current.FrozenUntil then
+		return
+	end
+	if now < segment.StartAt then
+		return -- the marker has not set off yet
+	end
+
+	local info = current.Info
+	local position, direction = ExtractionMath.positionAt(segment, now)
+	local rating =
+		ExtractionMath.rate(position, info.Zones[segment.Hit], info.PerfectWidth, info.GoodWidth)
+	current.Ratings[segment.Hit] = rating
+	ExtractionView.setPip(segment.Hit, rating)
+	playFeedback(current, rating, position)
+
+	current.FrozenUntil = now + info.HitPause
+	current.FrozenPos = position
+	current.AwaitingReply = true
+	current.LastTapAt = os.clock()
+	local nextHit = segment.Hit + 1
+	if nextHit <= info.Hits then
+		current.Segment = {
+			Hit = nextHit,
+			StartAt = now + info.HitPause,
+			StartPos = position,
+			StartDir = direction,
+			Speed = info.Speeds[nextHit],
+		}
+	else
+		current.Segment = nil
+		current.FinishedAt = os.clock()
+	end
+	Remotes.get("ExtractionTap"):FireServer(current.Id, now)
+end
+
+-- Server -> client. Arguments are checked before use.
+local function onStarted(id: any, raw: any)
+	if not isNumber(id) then
+		return
+	end
+	local info = readInfo(raw)
+	if info == nil then
+		return
+	end
+	if active then
+		close()
+	end
+	InventoryController.close()
+	active = {
+		Id = id,
+		Info = info,
+		Segment = {
+			Hit = 1,
+			StartAt = info.StartAt,
+			StartPos = info.StartPos,
+			StartDir = info.StartDir,
+			Speed = info.Speeds[1],
+		},
+		Ratings = {},
+		AwaitingReply = false,
+		FrozenUntil = 0,
+		FrozenPos = info.StartPos,
+		Opened = false,
+		LastTapAt = 0,
+		Result = nil,
+		ResultShownAt = 0,
+		FinishedAt = 0,
+	}
+end
+
+local function onTapResult(id: any, raw: any)
+	local current = active
+	if current == nil or id ~= current.Id or typeof(raw) ~= "table" then
+		return
+	end
+	current.AwaitingReply = false
+	local done = if isNumber(raw.Done) then raw.Done else #current.Ratings
+	local nextSegment = readSegment(raw.Next)
+
+	if raw.Ok == true then
+		local hit, rating = raw.Hit, raw.Rating
+		if isNumber(hit) and typeof(rating) == "string" and current.Ratings[hit] ~= rating then
+			-- The server saw it differently: show the real result.
+			current.Ratings[hit] = rating
+			ExtractionView.setPip(hit, rating)
+		end
+		if isNumber(raw.Position) and serverNow() < current.FrozenUntil then
+			current.FrozenPos = raw.Position
+		end
+	else
+		-- Refused: forget the predicted hits the server has not counted.
+		for index = #current.Ratings, done + 1, -1 do
+			current.Ratings[index] = nil
+			ExtractionView.setPip(index, nil)
+		end
+		current.FrozenUntil = 0
+		if done < current.Info.Hits then
+			current.FinishedAt = 0
+		end
+	end
+
+	-- The server's segment is the truth for where the marker goes next.
+	if done >= current.Info.Hits then
+		current.Segment = nil
+	elseif nextSegment then
+		current.Segment = nextSegment
+	end
+end
+
+local function onFinished(id: any, raw: any)
+	local current = active
+	if current == nil or id ~= current.Id or typeof(raw) ~= "table" then
+		return
+	end
+	local ratings: { string } = {}
+	if typeof(raw.Ratings) == "table" then
+		for index, rating in raw.Ratings do
+			if typeof(index) == "number" and typeof(rating) == "string" then
+				ratings[index] = rating
+			end
+		end
+	end
+	local condition = raw.Condition
+	current.Result = {
+		FossilId = if typeof(raw.FossilId) == "string" then raw.FossilId else current.Info.FossilId,
+		Rarity = if typeof(raw.Rarity) == "string" then raw.Rarity else current.Info.Rarity,
+		Condition = if isNumber(condition) then math.clamp(math.round(condition), 1, 100) else 1,
+		Ratings = ratings,
+		TimedOut = raw.TimedOut == true,
+	}
+	current.Segment = nil
+	current.AwaitingReply = false
+	if current.FinishedAt == 0 then
+		current.FinishedAt = os.clock()
+	end
+end
+
+local function step(delta: number)
+	ExtractionView.step(delta)
+	local current = active
+	if current == nil then
+		return
+	end
+	local now = serverNow()
+	local info = current.Info
+
+	if not current.Opened then
+		-- Let the reveal moment play first, but never past the marker's start.
+		local due = now >= info.StartAt - feel.OpenLead
+		if (due and not FossilController.isBusy()) or now >= info.StartAt or current.Result then
+			open(current)
+		else
+			return
+		end
+	end
+
+	-- The marker.
+	local segment = current.Segment
+	if now < current.FrozenUntil or segment == nil then
+		ExtractionView.setMarker(current.FrozenPos)
+	else
+		local position = ExtractionMath.positionAt(segment, now)
+		ExtractionView.setMarker(position)
+		showZone(current, segment.Hit)
+	end
+
+	-- The ending.
+	local result = current.Result
+	local clock = os.clock()
+	if result and current.ResultShownAt == 0 and now >= current.FrozenUntil then
+		showResult(current, result)
+		return
+	end
+	if current.ResultShownAt > 0 then
+		if clock - current.ResultShownAt >= feel.ResultHoldTime then
+			close()
+		end
+		return
+	end
+
+	-- An unanswered tap must not block the next one.
+	if current.AwaitingReply and clock - current.LastTapAt > feel.MaxWaitForServer then
+		current.AwaitingReply = false
+	end
+	-- Never leave the player stuck if the server stops answering.
+	local waitedTooLong = current.FinishedAt > 0
+		and clock - current.FinishedAt > feel.MaxWaitForServer
+	if waitedTooLong or now > info.Deadline + feel.MaxWaitForServer then
+		close()
+	end
+end
+
+-- Public API ---------------------------------------------------------------
+
+-- True while an extraction is running (or its result is on screen). Digging
+-- is paused meanwhile.
+function ExtractionController.isBusy(): boolean
+	return active ~= nil
+end
+
+-- A read-only look at the running extraction, for debugging and tests.
+function ExtractionController.getState(): { [string]: any }?
+	local current = active
+	if current == nil then
+		return nil
+	end
+	return {
+		Id = current.Id,
+		Info = current.Info,
+		Segment = current.Segment,
+		Ratings = table.clone(current.Ratings),
+		Opened = current.Opened,
+		AwaitingReply = current.AwaitingReply,
+		FrozenUntil = current.FrozenUntil,
+		Result = current.Result,
+		ResultShown = current.ResultShownAt > 0,
+	}
+end
+
+function ExtractionController.Start()
+	ExtractionView.build()
+	for _, target in ExtractionView.getInputTargets() do
+		target.InputBegan:Connect(function(input: InputObject)
+			local kind = input.UserInputType
+			if kind == Enum.UserInputType.MouseButton1 or kind == Enum.UserInputType.Touch then
+				ExtractionController.tap()
+			end
+		end)
+	end
+	Remotes.get("ExtractionStarted").OnClientEvent:Connect(onStarted)
+	Remotes.get("ExtractionTapResult").OnClientEvent:Connect(onTapResult)
+	Remotes.get("ExtractionFinished").OnClientEvent:Connect(onFinished)
+	RunService.RenderStepped:Connect(step)
+end
+
+return ExtractionController
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="55">
             <Properties>
               <string name="Name">FossilController</string>
               <string name="Source"><![CDATA[--!strict
@@ -3736,6 +5805,11 @@ return EffectsController
 
 	Everything here is cosmetic and local. If the server does not confirm, the
 	moment is quietly cancelled.
+
+	The uncovered fossil then hovers while the player extracts it
+	(ExtractionController). Each extraction hit makes it react (a swell and
+	sparkles for a good hit, chips flying off for a miss), and once it is
+	extracted it shrinks and flies away into the collection.
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -3743,6 +5817,7 @@ local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 
 local Shared = ReplicatedStorage.Shared
+local ExtractionConfig = require(Shared.Config.ExtractionConfig)
 local FeelConfig = require(Shared.Config.FeelConfig)
 local FossilConfig = require(Shared.Config.FossilConfig)
 local RarityConfig = require(Shared.Config.RarityConfig)
@@ -3777,13 +5852,19 @@ type Display = {
 	Light: PointLight,
 	Highlight: Highlight,
 	Intensity: number,
+	Color: Color3, -- the rarity colour
+	BumpStart: number, -- extraction hit reaction; 0 = none
+	BumpAmount: number,
+	CollectStart: number, -- extracted and flying away; 0 = not yet
 }
 
 local RECENT_BREAK_WINDOW = 3 -- seconds
+local COLLECT_SPIN = 720 -- degrees per second while flying away
 
 local FossilController = {}
 
 local reveal = FeelConfig.Reveal
+local extractFeel = ExtractionConfig.Feel
 local pending: PendingReveal? = nil
 local lockedUntil = 0
 local displays: { [BasePart]: Display } = {}
@@ -3921,6 +6002,10 @@ local function display(index: number, part: BasePart, defId: string, animate: bo
 		Light = light,
 		Highlight = highlight,
 		Intensity = feel.Intensity,
+		Color = rarity.Color,
+		BumpStart = 0,
+		BumpAmount = 0,
+		CollectStart = 0,
 	}
 	displays[part] = entry
 
@@ -3944,6 +6029,21 @@ local function display(index: number, part: BasePart, defId: string, animate: bo
 		highlight.DepthMode = Enum.HighlightDepthMode.Occluded
 		part.Size = def.Size
 		part.CFrame = CFrame.new(hover) * entry.Rotation
+	end
+end
+
+-- Hides an extracted fossil on this client. The server removes the part
+-- itself shortly after.
+local function hidePart(part: BasePart)
+	part.Transparency = 1
+	for _, child in part:GetChildren() do
+		local isEffect = child:IsA("PointLight")
+			or child:IsA("Highlight")
+			or child:IsA("ParticleEmitter")
+			or child:IsA("BillboardGui")
+		if isEffect then
+			(child :: any).Enabled = false
+		end
 	end
 end
 
@@ -3996,6 +6096,30 @@ local function step(delta: number)
 		else
 			entry.Angle += math.rad(reveal.IdleSpinSpeed) * delta
 		end
+
+		-- An extraction hit: swell for an instant, then settle.
+		if entry.BumpStart > 0 then
+			local alpha = math.clamp((now - entry.BumpStart) / extractFeel.BumpTime, 0, 1)
+			scale *= 1 + entry.BumpAmount * (1 - alpha) * (1 - alpha)
+			if alpha >= 1 then
+				entry.BumpStart = 0
+			end
+		end
+
+		-- Extracted: spin up, rise, shrink away.
+		if entry.CollectStart > 0 then
+			local alpha = math.clamp((now - entry.CollectStart) / extractFeel.CollectTime, 0, 1)
+			local eased = alpha * alpha
+			position += Vector3.new(0, extractFeel.CollectRise * eased, 0)
+			scale *= math.max(1 - eased, 0.01)
+			entry.Angle += math.rad(COLLECT_SPIN) * delta
+			if alpha >= 1 then
+				displays[part] = nil
+				hidePart(part)
+				continue
+			end
+		end
+
 		part.Size = entry.Size * scale
 		part.CFrame = CFrame.new(position) * CFrame.Angles(0, entry.Angle, 0) * entry.Rotation
 	end
@@ -4003,6 +6127,10 @@ end
 
 local function onFossilAdded(index: number, part: BasePart)
 	local defId = part:GetAttribute("DefId")
+	if part:GetAttribute("Stage") == "Extracted" then
+		hidePart(part)
+		return
+	end
 	if part:GetAttribute("Stage") == "Revealed" and typeof(defId) == "string" then
 		display(index, part, defId, false)
 		return
@@ -4095,6 +6223,39 @@ function FossilController.confirmReveal(index: number, defId: string)
 	end
 end
 
+-- An extraction hit landed on the fossil in this cell: make it react.
+function FossilController.extractionHit(index: number, rating: string)
+	local part = PlotController.getFossilPart(index)
+	local entry = part and displays[part]
+	local feel = extractFeel.Ratings[rating]
+	if part == nil or entry == nil or feel == nil then
+		return
+	end
+	if feel.Bump > 0 then
+		entry.BumpStart = os.clock()
+		entry.BumpAmount = feel.Bump
+	end
+	if feel.Sparkles > 0 then
+		ParticlePool.emit(reveal.SparkleParticles, part.Position, nil, feel.Sparkles, entry.Color)
+	end
+	if feel.Chips > 0 then
+		local chipSize = Vector3.new(1, 1, 1) * math.min(entry.Size.X, entry.Size.Y, entry.Size.Z)
+		DebrisField.burst(part.Position, chipSize, part.Color, part.Material, feel.Chips)
+	end
+end
+
+-- The fossil in this cell has been extracted: send it flying into the collection.
+function FossilController.collect(index: number)
+	local part = PlotController.getFossilPart(index)
+	local entry = part and displays[part]
+	if part == nil or entry == nil or entry.CollectStart > 0 then
+		return
+	end
+	entry.CollectStart = os.clock()
+	entry.BumpStart = 0
+	ParticlePool.emit(reveal.SparkleParticles, part.Position, nil, entry.Intensity, entry.Color)
+end
+
 -- The server did not agree that the fossil is uncovered yet.
 function FossilController.cancelReveal(index: number)
 	local current = pending
@@ -4113,19 +6274,20 @@ return FossilController
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="43">
+          <Item class="ModuleScript" referent="56">
             <Properties>
               <string name="Name">HudController</string>
               <string name="Source"><![CDATA[--!strict
 --[[
-	HudController: the placeholder heads-up display for Milestone 1.
+	HudController: the dig-site part of the heads-up display.
 
 	  * "Fossils 2 / 5": how many of this plot's fossils have been uncovered
 	  * a countdown once the plot is complete and about to refill
 
-	The proper interface (money, inventory, upgrades, pop-in tweens) arrives in
-	Milestone 5. This already follows the UI rules in Ui.luau so it scales on
-	phones.
+	The inventory button and panel belong to InventoryController, and the
+	extraction bar to ExtractionController. The full interface polish (money,
+	upgrades) arrives in Milestone 5. Everything follows the UI rules in
+	Ui.luau so it scales on phones.
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -4268,7 +6430,148 @@ return HudController
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="44">
+          <Item class="ModuleScript" referent="57">
+            <Properties>
+              <string name="Name">InventoryController</string>
+              <string name="Source"><![CDATA[--!strict
+--[[
+	InventoryController: this player's copy of their inventory, and the HUD
+	button and panel that show it (InventoryView).
+
+	The server owns the inventory. On start this client asks for the whole
+	list (InventoryRequest); after that the server sends each new find
+	(InventoryAdded). Every entry from the network is checked before use.
+
+	The panel lists finds rarest first, then by condition, and shows how far
+	along each fossil set is ("Triceratops 1/3"). Finds added since the panel
+	was last opened are tagged NEW.
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Shared = ReplicatedStorage.Shared
+local InventoryLogic = require(Shared.Inventory.InventoryLogic)
+local Remotes = require(Shared.Remotes)
+local Signal = require(Shared.Util.Signal)
+
+local Client = script.Parent.Parent
+local InventoryView = require(Client.Ui.InventoryView)
+local SoundPlayer = require(Client.Effects.SoundPlayer)
+
+local InventoryController = {}
+
+InventoryController.Changed = Signal.new() -- ()
+
+local entries: { InventoryLogic.Entry } = {}
+local newIds: { [number]: boolean } = {}
+
+local function render()
+	InventoryView.render(
+		InventoryLogic.sorted(entries),
+		newIds,
+		InventoryLogic.allSetProgress(entries)
+	)
+end
+
+local function refresh()
+	InventoryView.setCount(#entries)
+	if InventoryView.isOpen() then
+		render()
+	end
+	InventoryController.Changed:Fire()
+end
+
+local function indexOf(id: number): number?
+	for index, entry in entries do
+		if entry.Id == id then
+			return index
+		end
+	end
+	return nil
+end
+
+-- Server -> client: the whole list.
+local function onSync(raw: any)
+	if typeof(raw) ~= "table" then
+		return
+	end
+	local fresh: { InventoryLogic.Entry } = {}
+	for _, value in raw do
+		local entry = InventoryLogic.validate(value)
+		if entry then
+			table.insert(fresh, entry)
+		end
+	end
+	entries = fresh
+	refresh()
+end
+
+-- Server -> client: one new find.
+local function onAdded(raw: any)
+	local entry = InventoryLogic.validate(raw)
+	if entry == nil or indexOf(entry.Id) then
+		return
+	end
+	table.insert(entries, entry)
+	newIds[entry.Id] = true
+	refresh()
+end
+
+-- Public API ---------------------------------------------------------------
+
+-- A sorted copy of every find (rarest, then best condition first).
+function InventoryController.getEntries(): { InventoryLogic.Entry }
+	return InventoryLogic.sorted(entries)
+end
+
+function InventoryController.isOpen(): boolean
+	return InventoryView.isOpen()
+end
+
+function InventoryController.open()
+	if InventoryView.isOpen() then
+		return
+	end
+	render()
+	InventoryView.open()
+	SoundPlayer.play("InventoryOpen")
+end
+
+function InventoryController.close()
+	if not InventoryView.isOpen() then
+		return
+	end
+	InventoryView.close()
+	-- The player has seen them now.
+	table.clear(newIds)
+end
+
+function InventoryController.toggle()
+	if InventoryView.isOpen() then
+		InventoryController.close()
+	else
+		InventoryController.open()
+	end
+end
+
+-- Bounces the HUD button (called at the "Extracted!" moment).
+function InventoryController.pulse()
+	InventoryView.pulse()
+end
+
+function InventoryController.Start()
+	InventoryView.build(InventoryController.toggle, InventoryController.close)
+	InventoryView.setCount(0)
+	Remotes.get("InventorySync").OnClientEvent:Connect(onSync)
+	Remotes.get("InventoryAdded").OnClientEvent:Connect(onAdded)
+	Remotes.get("InventoryRequest"):FireServer()
+end
+
+return InventoryController
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="58">
             <Properties>
               <string name="Name">PlotController</string>
               <string name="Source"><![CDATA[--!strict
@@ -4475,7 +6778,7 @@ return PlotController
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="45">
+          <Item class="ModuleScript" referent="59">
             <Properties>
               <string name="Name">ToolController</string>
               <string name="Source"><![CDATA[--!strict
@@ -4785,11 +7088,11 @@ return ToolController
             </Properties>
           </Item>
         </Item>
-        <Item class="Folder" referent="46">
+        <Item class="Folder" referent="60">
           <Properties>
             <string name="Name">Effects</string>
           </Properties>
-          <Item class="ModuleScript" referent="47">
+          <Item class="ModuleScript" referent="61">
             <Properties>
               <string name="Name">CameraFx</string>
               <string name="Source"><![CDATA[--!strict
@@ -4876,7 +7179,7 @@ return CameraFx
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="48">
+          <Item class="ModuleScript" referent="62">
             <Properties>
               <string name="Name">CellVisuals</string>
               <string name="Source"><![CDATA[--!strict
@@ -5108,7 +7411,7 @@ return CellVisuals
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="49">
+          <Item class="ModuleScript" referent="63">
             <Properties>
               <string name="Name">DebrisField</string>
               <string name="Source"><![CDATA[--!strict
@@ -5254,7 +7557,7 @@ return DebrisField
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="50">
+          <Item class="ModuleScript" referent="64">
             <Properties>
               <string name="Name">EffectsRoot</string>
               <string name="Source"><![CDATA[--!strict
@@ -5291,7 +7594,7 @@ return {
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="51">
+          <Item class="ModuleScript" referent="65">
             <Properties>
               <string name="Name">ParticlePool</string>
               <string name="Source"><![CDATA[--!strict
@@ -5435,7 +7738,7 @@ return ParticlePool
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="52">
+          <Item class="ModuleScript" referent="66">
             <Properties>
               <string name="Name">SoundPlayer</string>
               <string name="Source"><![CDATA[--!strict
@@ -5561,7 +7864,7 @@ return SoundPlayer
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="53">
+          <Item class="ModuleScript" referent="67">
             <Properties>
               <string name="Name">TimeScale</string>
               <string name="Source"><![CDATA[--!strict
@@ -5624,7 +7927,7 @@ return TimeScale
             </Properties>
           </Item>
         </Item>
-        <Item class="LocalScript" referent="54">
+        <Item class="LocalScript" referent="68">
           <Properties>
             <string name="Name">Main</string>
             <string name="Source"><![CDATA[--!strict
@@ -5645,8 +7948,10 @@ local Controllers = script.Parent.Controllers
 local DebugController = require(Controllers.DebugController)
 local DigController = require(Controllers.DigController)
 local EffectsController = require(Controllers.EffectsController)
+local ExtractionController = require(Controllers.ExtractionController)
 local FossilController = require(Controllers.FossilController)
 local HudController = require(Controllers.HudController)
+local InventoryController = require(Controllers.InventoryController)
 local PlotController = require(Controllers.PlotController)
 local ToolController = require(Controllers.ToolController)
 
@@ -5654,6 +7959,8 @@ local controllers: { any } = {
 	EffectsController,
 	ToolController,
 	FossilController,
+	InventoryController,
+	ExtractionController,
 	DigController,
 	HudController,
 	DebugController,
@@ -5674,11 +7981,945 @@ end
 ]]></string>
           </Properties>
         </Item>
-        <Item class="Folder" referent="55">
+        <Item class="Folder" referent="69">
           <Properties>
             <string name="Name">Ui</string>
           </Properties>
-          <Item class="ModuleScript" referent="56">
+          <Item class="ModuleScript" referent="70">
+            <Properties>
+              <string name="Name">ExtractionView</string>
+              <string name="Source"><![CDATA[--!strict
+--[[
+	ExtractionView: the extraction minigame's interface. It only draws and
+	animates; the rules and timing live in ExtractionController.
+
+	Built from Scale sizes and aspect-ratio constraints (see Ui.luau), so it is
+	big and readable on a phone and capped on a monitor:
+	  * TapCatcher  an invisible full-screen button: a click or tap anywhere counts
+	  * Panel       sits just above the tool bar:
+	      Play      title, one pip per hit, the bar (track, Good zone,
+	                Perfect zone, marker) and a hint line
+	      Result    the "Extracted!" moment
+	      Flash     a white overlay for the Perfect flash
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+
+local ExtractionConfig = require(ReplicatedStorage.Shared.Config.ExtractionConfig)
+
+local Ui = require(script.Parent.Ui)
+
+type Refs = {
+	Catcher: TextButton,
+	Panel: Frame,
+	Scale: UIScale,
+	Stroke: UIStroke,
+	Play: Frame,
+	Title: TextLabel,
+	Pips: { Frame },
+	GoodZone: Frame,
+	PerfectZone: Frame,
+	Marker: Frame,
+	Popup: TextLabel,
+	PopupScale: UIScale,
+	Hint: TextLabel,
+	Flash: Frame,
+	Result: Frame,
+	Header: TextLabel,
+	HeaderScale: UIScale,
+	Line: TextLabel,
+	Sub: TextLabel,
+}
+
+local ExtractionView = {}
+
+local feel = ExtractionConfig.Feel
+local colors = feel.Colors
+
+-- Bottom edge of the panel, just above the tool bar (which starts at about 0.8).
+local PANEL_POSITION = UDim2.fromScale(0.5, 0.78)
+local POPUP_Y = -0.15
+local POPUP_RISE = 0.5
+
+local refs: Refs? = nil
+local openToken = 0
+local isShown = false
+local shakeLeft = 0
+local shakeAmount = 0
+
+local function text(name: string, properties: { [string]: any }, maxSize: number): TextLabel
+	local props: { [string]: any } = {
+		Name = name,
+		AnchorPoint = Vector2.new(0.5, 0),
+		BackgroundTransparency = 1,
+		TextScaled = true,
+		Font = Enum.Font.GothamBold,
+		TextColor3 = colors.Text,
+		TextStrokeTransparency = 0.6,
+		Text = "",
+	}
+	for key, value in properties do
+		props[key] = value
+	end
+	return Ui.create("TextLabel", props, {
+		Ui.create("UITextSizeConstraint", { MaxTextSize = maxSize }),
+	})
+end
+
+local function corner(radius: number): UICorner
+	return Ui.create("UICorner", { CornerRadius = UDim.new(radius, 0) })
+end
+
+local function zone(name: string, color: Color3, zIndex: number): Frame
+	return Ui.create("Frame", {
+		Name = name,
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromScale(0.2, 1),
+		BackgroundColor3 = color,
+		BorderSizePixel = 0,
+		ZIndex = zIndex,
+	}, { corner(0.3) })
+end
+
+-- Builds the (hidden) interface. Call once.
+function ExtractionView.build()
+	local hud = Ui.getHud()
+
+	local catcher = Ui.create("TextButton", {
+		Name = "ExtractionTapCatcher",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Text = "",
+		AutoButtonColor = false,
+		ZIndex = 40,
+		Visible = false,
+	}) :: TextButton
+
+	local pips: { Frame } = {}
+	local pipChildren: { Instance } = {
+		Ui.create("UIListLayout", {
+			FillDirection = Enum.FillDirection.Horizontal,
+			HorizontalAlignment = Enum.HorizontalAlignment.Center,
+			VerticalAlignment = Enum.VerticalAlignment.Center,
+			SortOrder = Enum.SortOrder.LayoutOrder,
+			Padding = UDim.new(0.06, 0),
+		}),
+	}
+	for index = 1, ExtractionConfig.Hits do
+		local pip = Ui.create("Frame", {
+			Name = `Pip{index}`,
+			LayoutOrder = index,
+			Size = UDim2.fromScale(0.2, 1),
+			BackgroundColor3 = colors.PipEmpty,
+			BorderSizePixel = 0,
+		}, {
+			Ui.create("UIAspectRatioConstraint", { AspectRatio = 1 }),
+			corner(0.5),
+			Ui.create("UIStroke", { Thickness = 2, Color = colors.Stroke }),
+		}) :: Frame
+		pips[index] = pip
+		table.insert(pipChildren, pip)
+	end
+	local pipRow = Ui.create("Frame", {
+		Name = "Pips",
+		AnchorPoint = Vector2.new(0.5, 0),
+		Position = UDim2.fromScale(0.5, 0.29),
+		Size = UDim2.fromScale(0.4, 0.15),
+		BackgroundTransparency = 1,
+	}, pipChildren) :: Frame
+
+	local goodZone = zone("GoodZone", colors.GoodZone, 2)
+	local perfectZone = zone("PerfectZone", colors.PerfectZone, 3)
+	local marker = Ui.create("Frame", {
+		Name = "Marker",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromScale(0.016, 1.55),
+		BackgroundColor3 = colors.Marker,
+		BorderSizePixel = 0,
+		ZIndex = 5,
+	}, {
+		corner(0.4),
+		Ui.create("UIStroke", { Thickness = 2, Color = colors.Stroke }),
+	}) :: Frame
+	local popupScale = Ui.create("UIScale", { Scale = 1 }) :: UIScale
+	local popup = text("Popup", {
+		AnchorPoint = Vector2.new(0.5, 1),
+		Position = UDim2.fromScale(0.5, POPUP_Y),
+		Size = UDim2.fromScale(0.4, 1.7),
+		ZIndex = 6,
+		TextStrokeTransparency = 0.2,
+		TextTransparency = 1,
+	}, 44)
+	popupScale.Parent = popup
+
+	local bar = Ui.create("Frame", {
+		Name = "Bar",
+		AnchorPoint = Vector2.new(0.5, 0),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromScale(0.9, 0.24),
+		BackgroundColor3 = colors.Track,
+		BorderSizePixel = 0,
+		ZIndex = 1,
+	}, {
+		corner(0.3),
+		Ui.create("UIStroke", { Thickness = 2, Color = colors.Stroke }),
+		goodZone,
+		perfectZone,
+		marker,
+		popup,
+	}) :: Frame
+
+	local title = text("Title", {
+		Position = UDim2.fromScale(0.5, 0.06),
+		Size = UDim2.fromScale(0.9, 0.2),
+		RichText = true,
+	}, 32)
+	local hint = text("Hint", {
+		Position = UDim2.fromScale(0.5, 0.82),
+		Size = UDim2.fromScale(0.9, 0.13),
+		TextColor3 = colors.Hint,
+		Font = Enum.Font.Gotham,
+	}, 22)
+
+	local play = Ui.create("Frame", {
+		Name = "Play",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+	}, { title, pipRow, bar, hint }) :: Frame
+
+	local headerScale = Ui.create("UIScale", { Scale = 1 }) :: UIScale
+	local header = text("Header", {
+		Position = UDim2.fromScale(0.5, 0.08),
+		Size = UDim2.fromScale(0.9, 0.32),
+		Text = "EXTRACTED!",
+		TextColor3 = colors.Header,
+		TextStrokeTransparency = 0.3,
+	}, 48)
+	headerScale.Parent = header
+	local line = text("Line", {
+		Position = UDim2.fromScale(0.5, 0.44),
+		Size = UDim2.fromScale(0.92, 0.24),
+		RichText = true,
+	}, 32)
+	local sub = text("Sub", {
+		Position = UDim2.fromScale(0.5, 0.72),
+		Size = UDim2.fromScale(0.9, 0.15),
+		TextColor3 = colors.Hint,
+		Font = Enum.Font.Gotham,
+	}, 22)
+	local result = Ui.create("Frame", {
+		Name = "Result",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Visible = false,
+	}, { header, line, sub }) :: Frame
+
+	local flash = Ui.create("Frame", {
+		Name = "Flash",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = Color3.new(1, 1, 1),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ZIndex = 20,
+	}, { corner(0.12) }) :: Frame
+
+	local scale = Ui.create("UIScale", { Scale = 1 }) :: UIScale
+	local stroke = Ui.create("UIStroke", { Thickness = 3, Color = colors.Stroke }) :: UIStroke
+	local panel = Ui.create("Frame", {
+		Name = "ExtractionPanel",
+		AnchorPoint = Vector2.new(0.5, 1),
+		Position = PANEL_POSITION,
+		Size = UDim2.fromScale(0.8, 0.38),
+		BackgroundColor3 = colors.Panel,
+		BackgroundTransparency = 0.08,
+		BorderSizePixel = 0,
+		ZIndex = 50,
+		Visible = false,
+	}, {
+		-- Wide and short, so it fits a landscape phone; capped on big screens.
+		Ui.create("UIAspectRatioConstraint", {
+			AspectRatio = 3.4,
+			AspectType = Enum.AspectType.FitWithinMaxSize,
+			DominantAxis = Enum.DominantAxis.Width,
+		}),
+		Ui.create("UISizeConstraint", { MaxSize = Vector2.new(800, 236) }),
+		corner(0.12),
+		stroke,
+		scale,
+		play,
+		result,
+		flash,
+	}) :: Frame
+
+	catcher.Parent = hud
+	panel.Parent = hud
+
+	refs = {
+		Catcher = catcher,
+		Panel = panel,
+		Scale = scale,
+		Stroke = stroke,
+		Play = play,
+		Title = title,
+		Pips = pips,
+		GoodZone = goodZone,
+		PerfectZone = perfectZone,
+		Marker = marker,
+		Popup = popup,
+		PopupScale = popupScale,
+		Hint = hint,
+		Flash = flash,
+		Result = result,
+		Header = header,
+		HeaderScale = headerScale,
+		Line = line,
+		Sub = sub,
+	}
+end
+
+-- The invisible full-screen button, and the panel: input on either is a tap.
+function ExtractionView.getInputTargets(): { GuiObject }
+	local r = refs
+	return if r then { r.Catcher, r.Panel } else {}
+end
+
+-- Shows the panel with a pop. `title` may use RichText.
+function ExtractionView.open(title: string, hint: string, rarityColor: Color3)
+	local r = refs
+	if r == nil then
+		return
+	end
+	openToken += 1
+	isShown = true
+	shakeLeft = 0
+	r.Title.Text = title
+	r.Hint.Text = hint
+	r.Stroke.Color = rarityColor
+	r.Play.Visible = true
+	r.Result.Visible = false
+	r.Popup.TextTransparency = 1
+	r.Flash.BackgroundTransparency = 1
+	r.Panel.Position = PANEL_POSITION
+	for index in r.Pips do
+		ExtractionView.setPip(index, nil)
+	end
+	r.Catcher.Visible = true
+	r.Panel.Visible = true
+	r.Scale.Scale = 0.6
+	local info = TweenInfo.new(feel.OpenTime, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+	TweenService:Create(r.Scale, info, { Scale = 1 }):Play()
+end
+
+-- Hides the panel. Input goes back to the world at once.
+function ExtractionView.close()
+	local r = refs
+	if r == nil or not isShown then
+		return
+	end
+	isShown = false
+	openToken += 1
+	local token = openToken
+	r.Catcher.Visible = false
+	local info = TweenInfo.new(feel.CloseTime, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+	TweenService:Create(r.Scale, info, { Scale = 0.6 }):Play()
+	task.delay(feel.CloseTime, function()
+		if openToken == token then
+			r.Panel.Visible = false
+		end
+	end)
+end
+
+function ExtractionView.isOpen(): boolean
+	return isShown
+end
+
+-- Places the safe zone. Positions and widths are fractions of the bar.
+function ExtractionView.setZone(center: number, perfectWidth: number, goodWidth: number)
+	local r = refs
+	if r == nil then
+		return
+	end
+	r.GoodZone.Position = UDim2.fromScale(center, 0.5)
+	r.GoodZone.Size = UDim2.fromScale(goodWidth, 1)
+	r.PerfectZone.Position = UDim2.fromScale(center, 0.5)
+	r.PerfectZone.Size = UDim2.fromScale(perfectWidth, 1)
+end
+
+function ExtractionView.setMarker(position: number)
+	local r = refs
+	if r then
+		r.Marker.Position = UDim2.fromScale(math.clamp(position, 0, 1), 0.5)
+	end
+end
+
+-- Colours a hit's pip by its rating; nil empties it.
+function ExtractionView.setPip(index: number, rating: string?)
+	local r = refs
+	local pip = r and r.Pips[index]
+	if pip == nil then
+		return
+	end
+	local ratingFeel = if rating then feel.Ratings[rating] else nil
+	pip.BackgroundColor3 = if ratingFeel then ratingFeel.Color else colors.PipEmpty
+end
+
+-- The PERFECT / GOOD / MISS popup above the bar, plus flash and shake.
+function ExtractionView.feedback(rating: string, position: number)
+	local r = refs
+	local ratingFeel = feel.Ratings[rating]
+	if r == nil or ratingFeel == nil then
+		return
+	end
+	local x = math.clamp(position, 0.15, 0.85)
+	r.Popup.Text = ratingFeel.Text
+	r.Popup.TextColor3 = ratingFeel.Color
+	r.Popup.TextTransparency = 0
+	r.Popup.Position = UDim2.fromScale(x, POPUP_Y)
+	r.PopupScale.Scale = 1.5
+	local pop = TweenInfo.new(0.18, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+	TweenService:Create(r.PopupScale, pop, { Scale = 1 }):Play()
+	local float = TweenInfo.new(feel.PopupTime, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+	TweenService:Create(r.Popup, float, {
+		Position = UDim2.fromScale(x, POPUP_Y - POPUP_RISE),
+		TextTransparency = 1,
+	}):Play()
+
+	if ratingFeel.Flash < 1 then
+		r.Flash.BackgroundTransparency = ratingFeel.Flash
+		local fade = TweenInfo.new(feel.FlashTime, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+		TweenService:Create(r.Flash, fade, { BackgroundTransparency = 1 }):Play()
+	end
+	if ratingFeel.PanelShake > 0 then
+		shakeLeft = feel.PanelShakeTime
+		shakeAmount = ratingFeel.PanelShake
+	end
+end
+
+-- Switches the panel to the "Extracted!" moment.
+--   line  e.g. "Ammonite: Excellent, 87%" (may use RichText)
+--   sub   a small line underneath
+function ExtractionView.showResult(line: string, sub: string)
+	local r = refs
+	if r == nil then
+		return
+	end
+	r.Play.Visible = false
+	r.Result.Visible = true
+	r.Line.Text = line
+	r.Sub.Text = sub
+	r.HeaderScale.Scale = 1.6
+	local pop = TweenInfo.new(0.35, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+	TweenService:Create(r.HeaderScale, pop, { Scale = 1 }):Play()
+	r.Flash.BackgroundTransparency = 0.4
+	local fade =
+		TweenInfo.new(feel.FlashTime * 1.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	TweenService:Create(r.Flash, fade, { BackgroundTransparency = 1 }):Play()
+end
+
+-- Call every frame with the real frame time (drives the panel shake).
+function ExtractionView.step(delta: number)
+	local r = refs
+	if r == nil or shakeLeft <= 0 then
+		return
+	end
+	shakeLeft = math.max(0, shakeLeft - delta)
+	local strength = shakeLeft / math.max(feel.PanelShakeTime, 0.01)
+	local offset = math.sin(shakeLeft * 70) * shakeAmount * strength
+	r.Panel.Position = PANEL_POSITION + UDim2.fromScale(offset, 0)
+end
+
+return ExtractionView
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="71">
+            <Properties>
+              <string name="Name">InventoryView</string>
+              <string name="Source"><![CDATA[--!strict
+--[[
+	InventoryView: the inventory button on the HUD and the panel it opens.
+	It only draws; InventoryController owns the data.
+
+	  * InventoryButton  right edge, clear of the jump button and thumbstick;
+	                     a badge shows how many finds there are
+	  * InventoryPanel   centred: a title, progress for each fossil set
+	                     ("Triceratops 1/3"), and a scrolling list of finds with
+	                     name, rarity colour and condition
+
+	Everything is sized with Scale and aspect-ratio constraints (Ui.luau rules).
+	List rows get their height from an aspect ratio, so the list's automatic
+	canvas size works without any pixel sizes.
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+
+local Shared = ReplicatedStorage.Shared
+local ExtractionMath = require(Shared.Extraction.ExtractionMath)
+local FossilConfig = require(Shared.Config.FossilConfig)
+local InventoryLogic = require(Shared.Inventory.InventoryLogic)
+local RarityConfig = require(Shared.Config.RarityConfig)
+
+local Ui = require(script.Parent.Ui)
+
+type Refs = {
+	Button: TextButton,
+	ButtonScale: UIScale,
+	Badge: Frame,
+	BadgeText: TextLabel,
+	Panel: Frame,
+	PanelScale: UIScale,
+	Count: TextLabel,
+	Close: TextButton,
+	Sets: Frame,
+	List: ScrollingFrame,
+	Empty: TextLabel,
+}
+
+local InventoryView = {}
+
+local PANEL_POSITION = UDim2.fromScale(0.5, 0.5)
+local PANEL_START = UDim2.fromScale(0.5, 0.56)
+local OPEN_TIME = 0.25
+local CLOSE_TIME = 0.15
+
+local DARK = Color3.fromRGB(34, 32, 36)
+local CARD = Color3.fromRGB(52, 49, 54)
+local CARD_ALT = Color3.fromRGB(60, 57, 62)
+local STROKE = Color3.fromRGB(14, 12, 14)
+local TEXT = Color3.fromRGB(250, 246, 235)
+local DIM = Color3.fromRGB(150, 146, 140)
+local GOLD = Color3.fromRGB(255, 214, 80)
+local BONE = Color3.fromRGB(236, 226, 200)
+
+local refs: Refs? = nil
+local shown = false
+local token = 0
+
+local function hex(color: Color3): string
+	return string.format(
+		"#%02X%02X%02X",
+		math.round(color.R * 255),
+		math.round(color.G * 255),
+		math.round(color.B * 255)
+	)
+end
+
+local function text(name: string, properties: { [string]: any }, maxSize: number): TextLabel
+	local props: { [string]: any } = {
+		Name = name,
+		BackgroundTransparency = 1,
+		TextScaled = true,
+		Font = Enum.Font.GothamBold,
+		TextColor3 = TEXT,
+		Text = "",
+	}
+	for key, value in properties do
+		props[key] = value
+	end
+	return Ui.create("TextLabel", props, {
+		Ui.create("UITextSizeConstraint", { MaxTextSize = maxSize }),
+	})
+end
+
+local function corner(radius: number): UICorner
+	return Ui.create("UICorner", { CornerRadius = UDim.new(radius, 0) })
+end
+
+local function blob(position: UDim2, size: UDim2): Frame
+	return Ui.create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = position,
+		Size = size,
+		BackgroundColor3 = BONE,
+		BorderSizePixel = 0,
+	}, { corner(0.5) })
+end
+
+-- A greybox bone made of frames, so no image assets are needed.
+local function boneIcon(): Frame
+	return Ui.create("Frame", {
+		Name = "Icon",
+		AnchorPoint = Vector2.new(0.5, 0),
+		Position = UDim2.fromScale(0.5, 0.1),
+		Size = UDim2.fromScale(0.7, 0.5),
+		BackgroundTransparency = 1,
+		Rotation = -30,
+	}, {
+		blob(UDim2.fromScale(0.5, 0.5), UDim2.fromScale(0.62, 0.22)),
+		blob(UDim2.fromScale(0.18, 0.36), UDim2.fromScale(0.22, 0.3)),
+		blob(UDim2.fromScale(0.18, 0.64), UDim2.fromScale(0.22, 0.3)),
+		blob(UDim2.fromScale(0.82, 0.36), UDim2.fromScale(0.22, 0.3)),
+		blob(UDim2.fromScale(0.82, 0.64), UDim2.fromScale(0.22, 0.3)),
+	})
+end
+
+local function buildButton(onPressed: () -> ()): (TextButton, UIScale, Frame, TextLabel)
+	local badgeText = text("Count", {
+		Size = UDim2.fromScale(1, 1),
+		TextColor3 = DARK,
+	}, 20)
+	local badge = Ui.create("Frame", {
+		Name = "Badge",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.88, 0.12),
+		Size = UDim2.fromScale(0.38, 0.38),
+		BackgroundColor3 = GOLD,
+		BorderSizePixel = 0,
+		Visible = false,
+		ZIndex = 3,
+	}, {
+		Ui.create("UIAspectRatioConstraint", { AspectRatio = 1 }),
+		corner(0.5),
+		Ui.create("UIStroke", { Thickness = 2, Color = STROKE }),
+		badgeText,
+	}) :: Frame
+	local scale = Ui.create("UIScale", { Scale = 1 }) :: UIScale
+	local button = Ui.create("TextButton", {
+		Name = "InventoryButton",
+		-- Right edge, above the jump button's corner on phones.
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.fromScale(0.985, 0.42),
+		Size = UDim2.fromScale(0.12, 0.15),
+		BackgroundColor3 = DARK,
+		BackgroundTransparency = 0.2,
+		BorderSizePixel = 0,
+		Text = "",
+		AutoButtonColor = true,
+	}, {
+		Ui.create("UIAspectRatioConstraint", { AspectRatio = 1 }),
+		Ui.create("UISizeConstraint", { MaxSize = Vector2.new(96, 96) }),
+		corner(0.22),
+		Ui.create("UIStroke", { Thickness = 3, Color = STROKE }),
+		scale,
+		boneIcon(),
+		text("Label", {
+			AnchorPoint = Vector2.new(0.5, 1),
+			Position = UDim2.fromScale(0.5, 0.94),
+			Size = UDim2.fromScale(0.86, 0.28),
+		}, 20),
+		badge,
+	}) :: TextButton
+	local label = button:FindFirstChild("Label") :: TextLabel
+	label.Text = "Finds"
+	button.Activated:Connect(onPressed)
+	return button, scale, badge, badgeText
+end
+
+-- Builds the button and the (hidden) panel. Call once.
+function InventoryView.build(onToggle: () -> (), onClose: () -> ())
+	local hud = Ui.getHud()
+	local button, buttonScale, badge, badgeText = buildButton(onToggle)
+
+	local closeButton = Ui.create("TextButton", {
+		Name = "Close",
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.fromScale(0.97, 0.03),
+		Size = UDim2.fromScale(0.1, 0.1),
+		BackgroundColor3 = Color3.fromRGB(200, 80, 70),
+		BorderSizePixel = 0,
+		Text = "X",
+		TextScaled = true,
+		Font = Enum.Font.GothamBold,
+		TextColor3 = TEXT,
+	}, {
+		Ui.create("UIAspectRatioConstraint", { AspectRatio = 1 }),
+		corner(0.25),
+		Ui.create("UITextSizeConstraint", { MaxTextSize = 28 }),
+	}) :: TextButton
+	closeButton.Activated:Connect(onClose)
+
+	local count = text("Count", {
+		Position = UDim2.fromScale(0.05, 0.13),
+		Size = UDim2.fromScale(0.6, 0.06),
+		TextColor3 = DIM,
+		Font = Enum.Font.Gotham,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, 18)
+
+	local sets = Ui.create("Frame", {
+		Name = "Sets",
+		Position = UDim2.fromScale(0.04, 0.21),
+		Size = UDim2.fromScale(0.92, 0.12),
+		BackgroundTransparency = 1,
+	}, {
+		Ui.create("UIListLayout", {
+			FillDirection = Enum.FillDirection.Vertical,
+			SortOrder = Enum.SortOrder.LayoutOrder,
+		}),
+	}) :: Frame
+
+	local list = Ui.create("ScrollingFrame", {
+		Name = "List",
+		Position = UDim2.fromScale(0.04, 0.35),
+		Size = UDim2.fromScale(0.92, 0.61),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		CanvasSize = UDim2.fromScale(0, 0),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ScrollingDirection = Enum.ScrollingDirection.Y,
+		ScrollBarThickness = 6,
+		ScrollBarImageColor3 = DIM,
+	}, {
+		Ui.create("UIListLayout", {
+			FillDirection = Enum.FillDirection.Vertical,
+			SortOrder = Enum.SortOrder.LayoutOrder,
+		}),
+	}) :: ScrollingFrame
+
+	local empty = text("Empty", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.62),
+		Size = UDim2.fromScale(0.8, 0.1),
+		TextColor3 = DIM,
+		Font = Enum.Font.Gotham,
+		Text = "Nothing here yet. Uncover a fossil and extract it!",
+	}, 22)
+
+	local panelScale = Ui.create("UIScale", { Scale = 1 }) :: UIScale
+	local panel = Ui.create("Frame", {
+		Name = "InventoryPanel",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = PANEL_POSITION,
+		Size = UDim2.fromScale(0.62, 0.8),
+		BackgroundColor3 = DARK,
+		BackgroundTransparency = 0.05,
+		BorderSizePixel = 0,
+		Active = true, -- clicks on the panel never reach the dig site behind it
+		Visible = false,
+		ZIndex = 30,
+	}, {
+		Ui.create("UIAspectRatioConstraint", {
+			AspectRatio = 1.3,
+			AspectType = Enum.AspectType.FitWithinMaxSize,
+			DominantAxis = Enum.DominantAxis.Width,
+		}),
+		Ui.create("UISizeConstraint", { MaxSize = Vector2.new(660, 508) }),
+		corner(0.05),
+		Ui.create("UIStroke", { Thickness = 3, Color = STROKE }),
+		panelScale,
+		text("Title", {
+			Position = UDim2.fromScale(0.05, 0.03),
+			Size = UDim2.fromScale(0.6, 0.1),
+			Text = "Your Finds",
+			TextXAlignment = Enum.TextXAlignment.Left,
+		}, 34),
+		count,
+		closeButton,
+		sets,
+		list,
+		empty,
+	}) :: Frame
+
+	button.Parent = hud
+	panel.Parent = hud
+
+	refs = {
+		Button = button,
+		ButtonScale = buttonScale,
+		Badge = badge,
+		BadgeText = badgeText,
+		Panel = panel,
+		PanelScale = panelScale,
+		Count = count,
+		Close = closeButton,
+		Sets = sets,
+		List = list,
+		Empty = empty,
+	}
+end
+
+local function buildSetRow(progress: InventoryLogic.SetProgress, order: number): Frame
+	local complete = progress.Owned >= progress.Total
+	local pieceText: { string } = {}
+	for _, piece in progress.Pieces do
+		local color = if piece.Owned then GOLD else DIM
+		table.insert(pieceText, `<font color="{hex(color)}">{piece.DisplayName}</font>`)
+	end
+	return Ui.create("Frame", {
+		Name = progress.SetId,
+		LayoutOrder = order,
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+	}, {
+		text("Progress", {
+			Size = UDim2.fromScale(0.32, 0.9),
+			Text = `{progress.DisplayName} {progress.Owned}/{progress.Total}`,
+			TextColor3 = if complete then GOLD else TEXT,
+			TextXAlignment = Enum.TextXAlignment.Left,
+		}, 24),
+		text("Pieces", {
+			Position = UDim2.fromScale(0.34, 0.15),
+			Size = UDim2.fromScale(0.66, 0.6),
+			RichText = true,
+			Font = Enum.Font.Gotham,
+			Text = table.concat(pieceText, "   "),
+			TextXAlignment = Enum.TextXAlignment.Left,
+		}, 18),
+	}) :: Frame
+end
+
+local function buildRow(entry: InventoryLogic.Entry, order: number, isNew: boolean): Frame
+	local def = FossilConfig.ById[entry.FossilId]
+	local rarity = RarityConfig.Rarities[entry.Rarity]
+	local rarityColor = if rarity then rarity.Color else TEXT
+	local grade = ExtractionMath.grade(entry.Condition)
+	local name = if def then def.DisplayName else entry.FossilId
+	if isNew then
+		name ..= ` <font color="{hex(GOLD)}">NEW</font>`
+	end
+
+	return Ui.create("Frame", {
+		Name = `Entry{entry.Id}`,
+		LayoutOrder = order,
+		Size = UDim2.fromScale(1, 0.1),
+		BackgroundTransparency = 1,
+	}, {
+		-- The row's height comes from its width, so no pixel sizes are needed.
+		Ui.create("UIAspectRatioConstraint", {
+			AspectRatio = 9,
+			AspectType = Enum.AspectType.ScaleWithParentSize,
+			DominantAxis = Enum.DominantAxis.Width,
+		}),
+		Ui.create("Frame", {
+			Name = "Card",
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0.49, 0.5),
+			Size = UDim2.fromScale(0.97, 0.86),
+			BackgroundColor3 = if order % 2 == 0 then CARD_ALT else CARD,
+			BorderSizePixel = 0,
+		}, {
+			corner(0.2),
+			Ui.create("Frame", {
+				Name = "Stripe",
+				Size = UDim2.fromScale(0.014, 1),
+				BackgroundColor3 = rarityColor,
+				BorderSizePixel = 0,
+			}),
+			text("FossilName", {
+				Position = UDim2.fromScale(0.035, 0.15),
+				Size = UDim2.fromScale(0.47, 0.7),
+				RichText = true,
+				Text = name,
+				TextXAlignment = Enum.TextXAlignment.Left,
+			}, 22),
+			text("Rarity", {
+				Position = UDim2.fromScale(0.52, 0.2),
+				Size = UDim2.fromScale(0.18, 0.6),
+				Text = if rarity then rarity.DisplayName else entry.Rarity,
+				TextColor3 = rarityColor,
+			}, 20),
+			text("Condition", {
+				Position = UDim2.fromScale(0.71, 0.15),
+				Size = UDim2.fromScale(0.27, 0.7),
+				Text = `{grade.Name} {entry.Condition}%`,
+				TextColor3 = grade.Color,
+				TextXAlignment = Enum.TextXAlignment.Right,
+			}, 22),
+		}),
+	}) :: Frame
+end
+
+-- Redraws the panel's contents.
+--   entries  already sorted for display
+--   newIds   entries to tag as NEW
+function InventoryView.render(
+	entries: { InventoryLogic.Entry },
+	newIds: { [number]: boolean },
+	sets: { InventoryLogic.SetProgress }
+)
+	local r = refs
+	if r == nil then
+		return
+	end
+	for _, child in r.List:GetChildren() do
+		if child:IsA("Frame") then
+			child:Destroy()
+		end
+	end
+	for _, child in r.Sets:GetChildren() do
+		if child:IsA("Frame") then
+			child:Destroy()
+		end
+	end
+
+	for order, progress in sets do
+		local row = buildSetRow(progress, order)
+		row.Size = UDim2.fromScale(1, 1 / math.max(#sets, 1))
+		row.Parent = r.Sets
+	end
+	for order, entry in entries do
+		buildRow(entry, order, newIds[entry.Id] == true).Parent = r.List
+	end
+	r.Count.Text = if #entries == 1 then "1 find" else `{#entries} finds`
+	r.Empty.Visible = #entries == 0
+end
+
+-- The count on the HUD button's badge.
+function InventoryView.setCount(count: number)
+	local r = refs
+	if r == nil then
+		return
+	end
+	r.Badge.Visible = count > 0
+	r.BadgeText.Text = if count > 99 then "99+" else tostring(count)
+end
+
+-- Makes the HUD button bounce, to show something was just added.
+function InventoryView.pulse()
+	local r = refs
+	if r == nil then
+		return
+	end
+	r.ButtonScale.Scale = 1.35
+	local info = TweenInfo.new(0.45, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+	TweenService:Create(r.ButtonScale, info, { Scale = 1 }):Play()
+end
+
+function InventoryView.open()
+	local r = refs
+	if r == nil or shown then
+		return
+	end
+	shown = true
+	token += 1
+	r.Panel.Visible = true
+	r.Panel.Position = PANEL_START
+	r.PanelScale.Scale = 0.85
+	local info = TweenInfo.new(OPEN_TIME, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+	TweenService:Create(r.PanelScale, info, { Scale = 1 }):Play()
+	TweenService:Create(r.Panel, info, { Position = PANEL_POSITION }):Play()
+end
+
+function InventoryView.close()
+	local r = refs
+	if r == nil or not shown then
+		return
+	end
+	shown = false
+	token += 1
+	local current = token
+	local info = TweenInfo.new(CLOSE_TIME, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+	TweenService:Create(r.PanelScale, info, { Scale = 0.85 }):Play()
+	task.delay(CLOSE_TIME, function()
+		if token == current then
+			r.Panel.Visible = false
+		end
+	end)
+end
+
+function InventoryView.isOpen(): boolean
+	return shown
+end
+
+return InventoryView
+]]></string>
+            </Properties>
+          </Item>
+          <Item class="ModuleScript" referent="72">
             <Properties>
               <string name="Name">Ui</string>
               <string name="Source"><![CDATA[--!strict

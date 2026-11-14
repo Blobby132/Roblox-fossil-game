@@ -5,9 +5,13 @@
 	It checks the things that would otherwise only show up in Studio:
 	  * both sides start without errors and build what they should
 	  * a full dig works end to end, by mouse and by touch
-	  * the server refuses bad, far, fast, flooded and malformed requests
+	  * every uncovered fossil is extracted by tapping (click, touch, Space)
+	    and lands in the inventory, which the HUD panel lists
+	  * the server refuses bad, far, fast, flooded and malformed requests,
+	    and rates extraction taps itself
 	  * the client undoes a prediction the server rejects
-	  * the plot refills, a respawn re-equips the tool, a leaving player frees the plot
+	  * the plot refills (but never mid-extraction), a respawn re-equips the
+	    tool, a leaving player frees the plot and loses the inventory
 
 	Run from the project folder:   lune run tests/sim
 ]]
@@ -18,6 +22,7 @@ local Harness = require("./lib/Harness")
 
 local test, expect, expectEqual = Harness.test, Harness.expect, Harness.expectEqual
 local Enum, Vector3, CFrame = roblox.Enum, roblox.Vector3, roblox.CFrame
+local UDim2 = roblox.UDim2
 
 local game = Harness.build()
 local serverRequire = Harness.newRequire("Server")
@@ -36,7 +41,14 @@ local WorldConfig = serverRequire(Shared.Config.WorldConfig)
 local FossilConfig = serverRequire(Shared.Config.FossilConfig)
 local GridMath = serverRequire(Shared.Dig.GridMath)
 local DigRules = serverRequire(Shared.Dig.DigRules)
+local ExtractionConfig = serverRequire(Shared.Config.ExtractionConfig)
+local ExtractionMath = serverRequire(Shared.Extraction.ExtractionMath)
+local InventoryLogic = serverRequire(Shared.Inventory.InventoryLogic)
+local RarityConfig = serverRequire(Shared.Config.RarityConfig)
 GridConfig.RefillDelay = 6
+GridConfig.RefillDelayAfterExtraction = 6
+-- Keep the test output clean; the analytics calls themselves still run.
+serverRequire(Shared.Config.AnalyticsConfig).PrintInStudio = false
 
 local dims = DigRules.Dims
 local camera = roblox.Instance.new("Camera")
@@ -124,6 +136,188 @@ local function findReply(replies: any, seq: number)
 	return nil
 end
 
+-- Extraction helpers ---------------------------------------------------------
+
+local function serverNow(): number
+	return Workspace:GetServerTimeNow()
+end
+
+local function extractionState()
+	return clientRequire(Client.Controllers.ExtractionController).getState()
+end
+
+local function hud()
+	return player.PlayerGui.DigHud
+end
+
+-- Every GuiObject under `root` must be sized and placed with Scale only.
+local function expectScaleOnly(root: any)
+	for _, descendant in root:GetDescendants() do
+		if descendant:IsA("GuiObject") then
+			local size, position = descendant.Size, descendant.Position
+			expect(
+				size.X.Offset == 0 and size.Y.Offset == 0,
+				descendant:GetFullName() .. " is sized with Offset"
+			)
+			expect(
+				position.X.Offset == 0 and position.Y.Offset == 0,
+				descendant:GetFullName() .. " is positioned with Offset"
+			)
+		end
+	end
+end
+
+-- The first moment from `from` on when the marker passes `target`.
+local function timeMarkerReaches(segment: any, target: number, from: number): number
+	local t = math.max(from, segment.StartAt)
+	local step = 1 / 480
+	local previous = ExtractionMath.positionAt(segment, t) - target
+	for _ = 1, 5000 do
+		local nextT = t + step
+		local value = ExtractionMath.positionAt(segment, nextT) - target
+		if previous == 0 or (previous < 0) ~= (value < 0) then
+			-- Narrow it down, so the tap lands right on the target.
+			local low, high = t, nextT
+			for _ = 1, 30 do
+				local mid = (low + high) / 2
+				local midValue = ExtractionMath.positionAt(segment, mid) - target
+				if (midValue < 0) == (previous < 0) and midValue ~= 0 then
+					low = mid
+				else
+					high = mid
+				end
+			end
+			return high
+		end
+		t, previous = nextT, value
+	end
+	error("the marker never reached " .. target)
+end
+
+-- Where to stop the marker to earn a rating on this hit.
+local function targetFor(info: any, hit: number, rating: string): number
+	local center = info.Zones[hit]
+	if rating == "Perfect" then
+		return center
+	elseif rating == "Good" then
+		local offset = (info.PerfectWidth + info.GoodWidth) / 4
+		return if center + offset <= 0.97 then center + offset else center - offset
+	end
+	return if center > 0.5 then 0.03 else 0.97
+end
+
+-- One extraction tap, by click, touch or the Space key.
+local function extractionTap(method: string)
+	if method == "space" then
+		Harness.keyPress(Enum.KeyCode.Space)
+	else
+		local inputType = if method == "touch"
+			then Enum.UserInputType.Touch
+			else Enum.UserInputType.MouseButton1
+		Harness.guiInput(hud().ExtractionTapCatcher, inputType)
+	end
+end
+
+local function waitForExtractionBar()
+	Harness.roundTrip()
+	local guard = 0
+	while true do
+		local state = extractionState()
+		if state and state.Opened then
+			return state
+		end
+		Harness.frame()
+		guard += 1
+		expect(guard < 600, "the extraction bar never opened")
+	end
+end
+
+local function findMessage(messages: any, remoteName: string)
+	for _, message in messages do
+		if message.remote.Name == remoteName then
+			return message.args
+		end
+	end
+	return nil
+end
+
+local extractedCount = 0
+
+-- Plays the running extraction through the client: waits for the bar, then
+-- taps when the marker is where each wanted rating needs it. Returns the
+-- server's ExtractionFinished result.
+local function playExtraction(wanted: { string }, methods: { string }?)
+	local state = waitForExtractionBar()
+	local finished = nil
+	for hit, rating in wanted do
+		state = extractionState()
+		local segment = state.Segment
+		expect(segment ~= nil, `no segment for hit {hit}`)
+		expectEqual(segment.Hit, hit, "segment hit number")
+		local at = timeMarkerReaches(segment, targetFor(state.Info, hit, rating), serverNow())
+		Harness.advance(at - serverNow())
+		extractionTap(if methods then methods[hit] else "click")
+		expectEqual(extractionState().Ratings[hit], rating, `predicted rating for hit {hit}`)
+		local replies = Harness.roundTrip()
+		local reply = findMessage(replies, "ExtractionTapResult")
+		expect(reply ~= nil, `no reply to tap {hit}`)
+		expect(reply[2].Ok, `the server refused tap {hit}: {reply[2].Code}`)
+		expectEqual(reply[2].Rating, rating, `server rating for hit {hit}`)
+		finished = findMessage(replies, "ExtractionFinished") or finished
+	end
+	expect(finished ~= nil, "the server never sent ExtractionFinished")
+	extractedCount += 1
+	-- Let the last rating show, then the "Extracted!" moment.
+	playFrames(ExtractionConfig.HitPause + 0.1)
+	expect(extractionState().ResultShown, "the Extracted! moment did not show")
+	return finished[2]
+end
+
+-- Ends the "Extracted!" moment early with a tap, as a player would.
+local function closeExtraction()
+	Harness.advance(ExtractionConfig.Feel.MinResultTime)
+	extractionTap("click")
+	Harness.frame()
+	expect(extractionState() == nil, "the extraction is still open")
+end
+
+-- Digs up and brushes the next buried fossil through the client, which
+-- starts its extraction. Reseeds the plot first if none is left.
+local function uncoverNextFossil(): number
+	-- A refill that is already counting down would rebuild the ground mid-dig.
+	local refillAt = plot.Model:GetAttribute("RefillAt") or 0
+	if refillAt > 0 then
+		Harness.advance(math.max(refillAt - serverNow(), 0) + 0.1)
+		Harness.roundTrip()
+	end
+	local function nextBuried()
+		for index, fossil in plot.State.Fossils do
+			if fossil.Stage ~= "Revealed" then
+				return index, fossil
+			end
+		end
+		return nil, nil
+	end
+	local index, fossil = nextBuried()
+	if index == nil then
+		Harness.advance(1)
+		Harness.fireServer("DebugRequest", "Reseed")
+		Harness.roundTrip()
+		Harness.roundTrip()
+		index, fossil = nextBuried()
+	end
+	digDownTo(fossil.CellIndex)
+	local crust = plot.FossilParts[index]
+	selectTool("Brush")
+	local guard = 0
+	while fossil.Stage ~= "Revealed" do
+		swing(crust, "Brush")
+		guard += 1
+		expect(guard < 20, "the fossil was never uncovered")
+	end
+	return index
+end
+
 -- A surface cell that is still standing, away from the fossil columns.
 local function freshSurfaceCell(skip: number?): number
 	local taken = {}
@@ -165,7 +359,7 @@ test("the server starts and builds the dig site", function()
 	end
 	local remotes = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
 	expect(remotes ~= nil, "the Remotes folder was not created")
-	expectEqual(#remotes:GetChildren(), 5, "remote events")
+	expectEqual(#remotes:GetChildren(), 12, "remote events")
 end)
 
 test("a joining player gets a plot, a spawn pad and a pickaxe", function()
@@ -252,6 +446,20 @@ test("the client starts and builds its interface", function()
 		end
 	end
 	expect(toolBar:FindFirstChildOfClass("UIAspectRatioConstraint") ~= nil, "tool bar aspect ratio")
+
+	-- Milestone 2: the inventory button shows; the panels are built but hidden.
+	local button = hud:FindFirstChild("InventoryButton")
+	expect(button ~= nil and button.Visible, "the inventory button is missing")
+	expect(not button.Badge.Visible, "an empty inventory should show no badge")
+	expect(not hud.InventoryPanel.Visible, "the inventory panel should start closed")
+	expect(not hud.ExtractionPanel.Visible, "the extraction panel should start hidden")
+	expect(not hud.ExtractionTapCatcher.Visible, "the tap catcher should start hidden")
+	for _, name in { "InventoryButton", "InventoryPanel", "ExtractionPanel" } do
+		expect(
+			hud[name]:FindFirstChildOfClass("UIAspectRatioConstraint") ~= nil,
+			name .. " has no aspect ratio constraint"
+		)
+	end
 end)
 
 ------------------------------------------------------------------------------
@@ -310,12 +518,26 @@ test("the brush cannot break rock, on the client or the server", function()
 	Harness.advance(1)
 end)
 
-test("every fossil can be dug up, brushed and revealed", function()
+test("every fossil can be dug up, brushed, revealed and extracted", function()
 	local FossilController = clientRequire(Client.Controllers.FossilController)
 	local TimeScale = clientRequire(Client.Effects.TimeScale)
+	local InventoryService = serverRequire(Server.Services.InventoryService)
 	local found = 0
+	local generation = plot.Generation
+	local patterns = {
+		{ "Perfect", "Perfect", "Perfect" },
+		{ "Perfect", "Good", "Miss" },
+		{ "Good", "Good", "Good" },
+		{ "Miss", "Perfect", "Good" },
+	}
+	local methods = { "click", "touch", "space" }
 
 	for fossilIndex, fossil in plot.State.Fossils do
+		local isLast = fossilIndex == #plot.State.Fossils
+		if isLast then
+			-- Make the refill come due while the last fossil is being extracted.
+			GridConfig.RefillDelay = 1
+		end
 		digDownTo(fossil.CellIndex)
 		expectEqual(fossil.Stage, "Encased", "stage once its cell breaks")
 
@@ -357,6 +579,34 @@ test("every fossil can be dug up, brushed and revealed", function()
 
 		local counter = player.PlayerGui.DigHud.FossilCounter.Counter
 		expectEqual(counter.Text, `Fossils {found} / {#plot.State.Fossils}`, "counter text")
+
+		-- Uncovering it started the extraction, which holds back the refill.
+		if isLast then
+			expect(plot.RefillPending, "the refill should wait for the running extraction")
+			expectEqual(plot.Generation, generation, "the plot refilled during an extraction")
+			expect(crust.Parent ~= nil, "the fossil vanished during its extraction")
+		end
+		local rotated = {}
+		for hit = 1, 3 do
+			rotated[hit] = methods[(fossilIndex + hit - 2) % #methods + 1]
+		end
+		local result = playExtraction(patterns[(fossilIndex - 1) % #patterns + 1], rotated)
+		local entries = InventoryService.GetEntries(player)
+		expectEqual(#entries, extractedCount, "inventory entries")
+		local newest = entries[#entries]
+		expectEqual(newest.FossilId, fossil.DefId, "the inventory got the wrong fossil")
+		expectEqual(newest.Condition, result.Condition, "inventory condition")
+		expectEqual(newest.Rarity, FossilConfig.ById[fossil.DefId].Rarity, "inventory rarity")
+		closeExtraction()
+
+		if isLast then
+			expect(not plot.RefillPending, "the waiting refill was not rescheduled")
+			expect(
+				plot.Model:GetAttribute("RefillAt") > serverNow(),
+				"no refill countdown after the extraction"
+			)
+			GridConfig.RefillDelay = 6
+		end
 	end
 end)
 
@@ -600,6 +850,8 @@ test("a predicted reveal is cancelled when the server refuses it", function()
 	expectEqual(fossil.Stage, "Revealed", "server stage after a real last stroke")
 	playFrames(2.5)
 	expect(crust:FindFirstChildOfClass("Highlight") ~= nil, "no glow after the real reveal")
+	playExtraction({ "Good", "Good", "Good" })
+	closeExtraction()
 end)
 
 test("an unanswered swing is forgotten after the timeout", function()
@@ -670,6 +922,360 @@ test("a touch-only device digs by tapping and switches tools with the buttons", 
 end)
 
 ------------------------------------------------------------------------------
+print("\nExtraction")
+
+test("uncovering a fossil starts its extraction, and digging waits for it", function()
+	local ExtractionService = serverRequire(Server.Services.ExtractionService)
+	local index = uncoverNextFossil()
+	local active = ExtractionService.GetActive(player)
+	expect(active ~= nil, "the server did not start an extraction")
+	expectEqual(active.FossilIndex, index, "the extraction is for the wrong fossil")
+
+	-- The same fossil can never start twice, and nothing else starts meanwhile.
+	expect(not ExtractionService.Begin(player, plot, index), "the same fossil started twice")
+	for otherIndex in plot.State.Fossils do
+		expect(not ExtractionService.Begin(player, plot, otherIndex), "a second extraction started")
+	end
+
+	local state = waitForExtractionBar()
+	local panel = hud().ExtractionPanel
+	expect(panel.Visible, "the extraction panel is not showing")
+	expect(hud().ExtractionTapCatcher.Visible, "the tap catcher is not showing")
+	expectScaleOnly(panel)
+	local action = Harness.boundActions.ExtractionTap
+	expect(action and table.find(action.inputs, Enum.KeyCode.Space), "Space is not bound")
+	local name = FossilConfig.ById[state.Info.FossilId].DisplayName
+	expect(string.find(panel.Play.Title.Text, name, 1, true), "the title does not name the fossil")
+
+	-- Digging is paused: a click sends nothing, and a forced swing is refused.
+	local cell = freshSurfaceCell()
+	standAbove(cell)
+	selectTool("Pickaxe")
+	aimAt(plot.CellParts[cell])
+	Harness.click()
+	expect(
+		findMessage(Harness.roundTrip(), "SwingResult") == nil,
+		"a swing was sent mid-extraction"
+	)
+	expectEqual(plot.State.Cells[cell].Health, 3, "a cell was dug during extraction")
+	Harness.fireServer("SwingRequest", 9600, cell)
+	expectEqual(findReply(Harness.roundTrip(), 9600)[3], "Extracting", "forced swing ruling")
+
+	-- Play it: one tap by click, one by touch, one by Space.
+	local part = plot.FossilParts[index]
+	local serverState = active.State
+	local sounds = Harness.stats.soundsPlayed
+	local result = playExtraction({ "Perfect", "Good", "Miss" }, { "click", "touch", "space" })
+	expect(Harness.stats.soundsPlayed >= sounds + 4, "rating and Extracted! sounds did not play")
+	expectEqual(table.concat(result.Ratings, ","), "Perfect,Good,Miss", "server ratings")
+	expectEqual(result.Condition, ExtractionMath.condition(serverState.Points), "condition")
+	local feel = ExtractionConfig.Feel.Ratings
+	expectEqual(panel.Play.Pips.Pip1.BackgroundColor3, feel.Perfect.Color, "Perfect pip")
+	expectEqual(panel.Play.Pips.Pip3.BackgroundColor3, feel.Miss.Color, "Miss pip")
+	expectEqual(panel.Play.Bar.Popup.Text, feel.Miss.Text, "last popup")
+
+	-- The "Extracted!" moment: "Ammonite: Excellent, 87%".
+	expect(panel.Result.Visible, "the result is not showing")
+	local line = string.gsub(panel.Result.Line.Text, "<[^>]+>", "")
+	expectEqual(line, ExtractionMath.describe(name, result.Condition), "result line")
+
+	-- The fossil flies off, then the server removes it.
+	playFrames(ExtractionConfig.Feel.CollectTime + 0.1)
+	expectEqual(part.Transparency, 1, "the extracted fossil is still showing")
+	expectEqual(part:GetAttribute("Stage"), "Extracted", "Stage attribute")
+	closeExtraction()
+	expect(not hud().ExtractionTapCatcher.Visible, "the tap catcher is still up")
+	expect(Harness.boundActions.ExtractionTap == nil, "Space is still bound")
+	Harness.advance(ExtractionConfig.Server.RemovePartDelay)
+	expect(plot.FossilParts[index] == nil and part.Parent == nil, "the fossil part was not removed")
+	expect(not ExtractionService.Begin(player, plot, index), "an extracted fossil started again")
+
+	-- Digging works again.
+	standAbove(cell)
+	swing(plot.CellParts[cell], "Pickaxe")
+	expectEqual(plot.State.Cells[cell].Health, 2, "digging after the extraction")
+end)
+
+test("three misses still give the fossil", function()
+	local InventoryService = serverRequire(Server.Services.InventoryService)
+	local before = #InventoryService.GetEntries(player)
+	uncoverNextFossil()
+	local result = playExtraction({ "Miss", "Miss", "Miss" }, { "touch", "touch", "touch" })
+	expect(result.Condition >= 1, "condition below 1")
+	expect(result.Condition < 40, `three misses gave condition {result.Condition}`)
+	expectEqual(#InventoryService.GetEntries(player), before + 1, "the fossil was not added")
+	closeExtraction()
+end)
+
+test("the server rates taps itself and refuses bad ones", function()
+	local ExtractionService = serverRequire(Server.Services.ExtractionService)
+	local InventoryService = serverRequire(Server.Services.InventoryService)
+	local limits = ExtractionConfig.Server
+	Harness.advance(2)
+	uncoverNextFossil()
+	Harness.roundTrip()
+	local active = ExtractionService.GetActive(player)
+	local id, state = active.Id, active.State
+	local setup = state.Setup
+
+	local function tapReply(claimed: number)
+		Harness.fireServer("ExtractionTap", id, claimed)
+		local reply = findMessage(Harness.roundTrip(), "ExtractionTapResult")
+		expect(reply ~= nil, "no reply to a tap")
+		return reply[2]
+	end
+
+	-- Malformed taps are ignored outright.
+	Harness.fireServer("ExtractionTap")
+	Harness.fireServer("ExtractionTap", "x", 1)
+	Harness.fireServer("ExtractionTap", id, "now")
+	Harness.fireServer("ExtractionTap", id, 0 / 0)
+	Harness.fireServer("ExtractionTap", id, math.huge)
+	Harness.fireServer("ExtractionTap", 1.5, serverNow())
+	Harness.fireServer("ExtractionTap", 0 / 0, serverNow())
+	Harness.fireServer("ExtractionTap", {}, {})
+	expect(
+		findMessage(Harness.roundTrip(), "ExtractionTapResult") == nil,
+		"a malformed tap got a reply"
+	)
+	expectEqual(#state.Ratings, 0, "a malformed tap was rated")
+
+	-- Before the marker sets off.
+	expect(serverNow() < setup.StartAt, "the test is too slow: the marker already started")
+	expectEqual(tapReply(serverNow()).Code, "NotStarted", "a tap before the start")
+
+	-- A normal tap, then one straight after it, then one during the pause.
+	Harness.advance(setup.StartAt - serverNow() + 0.3)
+	local first = tapReply(serverNow())
+	expect(first.Ok, "a normal tap was refused")
+	expectEqual(extractionState().Ratings[1], first.Rating, "the client shows the server's rating")
+	expectEqual(tapReply(serverNow()).Code, "TooFast", "a second tap at the same moment")
+	Harness.advance(limits.MinTapInterval + 0.05)
+	expectEqual(tapReply(serverNow()).Code, "TooFast", "a tap during the pause")
+	expectEqual(#state.Ratings, 1, "refused taps were counted")
+
+	-- Claiming a Perfect moment that is long gone: rated at the lag limit instead.
+	local segment = state.Segment
+	local perfectAt = timeMarkerReaches(segment, setup.Zones[2], segment.StartAt)
+	Harness.advance(perfectAt - serverNow() + limits.LagAllowance + 0.4)
+	local arrival = serverNow()
+	local old = tapReply(perfectAt)
+	expect(old.Ok, "an old tap was refused")
+	expect(
+		math.abs(old.RatedAt - (arrival - limits.LagAllowance)) < 1e-6,
+		"an old timestamp was trusted"
+	)
+	local position = ExtractionMath.positionAt(segment, arrival - limits.LagAllowance)
+	local expected =
+		ExtractionMath.rate(position, setup.Zones[2], setup.PerfectWidth, setup.GoodWidth)
+	expectEqual(old.Rating, expected, "rating at the adjusted moment")
+
+	-- Someone else's extraction cannot be tapped.
+	local rival = Harness.addPlayer("Rival", 1003)
+	local rivalPlot = PlotService.GetPlot(rival)
+	rivalPlot.State.Fossils[1].Stage = "Revealed"
+	expect(ExtractionService.Begin(rival, rivalPlot, 1), "the rival's extraction did not start")
+	local rivalExtraction = ExtractionService.GetActive(rival)
+	Harness.advance(1)
+	Harness.fireServer("ExtractionTap", rivalExtraction.Id, serverNow())
+	local stolen = findMessage(Harness.roundTrip(), "ExtractionTapResult")[2]
+	expect(not stolen.Ok and stolen.Code == "NotYours", "tapped someone else's extraction")
+	expectEqual(#rivalExtraction.State.Ratings, 0, "the rival's extraction was changed")
+	Harness.removePlayer(rival)
+	expect(ExtractionService.GetActive(rival) == nil, "a leaving player's extraction was kept")
+	expect(not rivalPlot.RefillHeld, "a leaving player's refill hold was kept")
+
+	-- A timestamp from the future: rated at the clock tolerance.
+	Harness.advance(0.5)
+	local now = serverNow()
+	local future = tapReply(now + 5)
+	expect(future.Ok, "a future tap was refused")
+	expect(
+		math.abs(future.RatedAt - (now + limits.ClockTolerance)) < 1e-6,
+		"a future timestamp was trusted"
+	)
+	expect(ExtractionService.GetActive(player) == nil, "three rated taps did not finish it")
+	extractedCount += 1
+
+	-- Extra taps after the end change nothing.
+	local count = #InventoryService.GetEntries(player)
+	Harness.advance(1)
+	expect(not tapReply(serverNow()).Ok, "an extra tap was accepted")
+	expectEqual(#InventoryService.GetEntries(player), count, "an extra tap added a fossil")
+
+	-- A flood is cut off.
+	Harness.advance(2)
+	for _ = 1, 50 do
+		Harness.fireServer("ExtractionTap", id, serverNow())
+	end
+	local replies = 0
+	for _, message in Harness.roundTrip() do
+		if message.remote.Name == "ExtractionTapResult" then
+			replies += 1
+		end
+	end
+	expect(replies <= limits.RequestBurst + 1, `the server answered {replies} of 50 flooded taps`)
+
+	playFrames(ExtractionConfig.Feel.ResultHoldTime + 0.5)
+	expect(extractionState() == nil, "the extraction never closed")
+	Harness.advance(2)
+end)
+
+test("an extraction left alone finishes by itself and still gives the fossil", function()
+	local InventoryService = serverRequire(Server.Services.InventoryService)
+	local before = #InventoryService.GetEntries(player)
+	uncoverNextFossil()
+	Harness.roundTrip()
+	Harness.advance(ExtractionConfig.StartDelay + ExtractionConfig.Server.MaxDuration + 0.5)
+	local finished = findMessage(Harness.roundTrip(), "ExtractionFinished")
+	expect(finished ~= nil, "the extraction never finished")
+	expect(finished[2].TimedOut, "not marked as timed out")
+	expectEqual(table.concat(finished[2].Ratings, ","), "Miss,Miss,Miss", "ratings")
+	expectEqual(#InventoryService.GetEntries(player), before + 1, "the fossil was not added")
+	extractedCount += 1
+
+	playFrames(0.5)
+	expect(extractionState().ResultShown, "the result did not show")
+	local sub = hud().ExtractionPanel.Result.Sub.Text
+	expect(string.find(sub, "Out of time", 1, true), "no out-of-time message")
+	playFrames(ExtractionConfig.Feel.ResultHoldTime + 0.3)
+	expect(extractionState() == nil, "the result never closed by itself")
+end)
+
+------------------------------------------------------------------------------
+print("\nInventory")
+
+test("every find is its own entry, on the server and the client", function()
+	local InventoryService = serverRequire(Server.Services.InventoryService)
+	local InventoryController = clientRequire(Client.Controllers.InventoryController)
+	local entries = InventoryService.GetEntries(player)
+	expectEqual(#entries, extractedCount, "server entries")
+	local ids = {}
+	for _, entry in entries do
+		expect(not ids[entry.Id], "two entries share an id")
+		ids[entry.Id] = true
+		expect(InventoryLogic.validate(entry) ~= nil, "an invalid entry")
+		expectEqual(entry.Rarity, FossilConfig.ById[entry.FossilId].Rarity, "entry rarity")
+		expect(math.abs(entry.FoundAt - os.time()) < 3600, "FoundAt is not a real time")
+	end
+
+	-- Duplicates in different condition stay separate.
+	InventoryService.Add(player, "Ammonite", 41, os.time())
+	InventoryService.Add(player, "Ammonite", 92, os.time())
+	InventoryService.Add(player, "TriceratopsHorn", 77, os.time())
+	extractedCount += 3
+	Harness.roundTrip()
+	expectEqual(#InventoryController.getEntries(), extractedCount, "client entries")
+	expectEqual(hud().InventoryButton.Badge.Count.Text, tostring(extractedCount), "badge count")
+
+	-- Asking again sends the whole list, which matches.
+	Harness.advance(2)
+	Harness.fireServer("InventoryRequest")
+	local sync = findMessage(Harness.roundTrip(), "InventorySync")
+	expect(sync ~= nil, "no InventorySync reply")
+	expectEqual(#sync[1], extractedCount, "synced entries")
+	expectEqual(#InventoryController.getEntries(), extractedCount, "client entries after a sync")
+end)
+
+test("the inventory panel lists finds sorted, with Triceratops set progress", function()
+	local InventoryService = serverRequire(Server.Services.InventoryService)
+	local button = hud().InventoryButton
+	local panel = hud().InventoryPanel
+	Harness.press(button)
+	Harness.frame()
+	expect(panel.Visible, "the panel did not open")
+	expectEqual(panel.UIScale.Scale, 1, "the panel did not tween in")
+	expectEqual(panel.Position, UDim2.fromScale(0.5, 0.5), "the panel did not slide into place")
+	expectScaleOnly(panel)
+
+	local sorted = InventoryService.GetSorted(player)
+	local rows = {}
+	for _, child in panel.List:GetChildren() do
+		if child:IsA("Frame") then
+			table.insert(rows, child)
+		end
+	end
+	table.sort(rows, function(a, b)
+		return a.LayoutOrder < b.LayoutOrder
+	end)
+	expectEqual(#rows, #sorted, "rows in the list")
+	for index, entry in sorted do
+		expectEqual(rows[index].Name, `Entry{entry.Id}`, `row {index}`)
+		expect(
+			rows[index]:FindFirstChildOfClass("UIAspectRatioConstraint") ~= nil,
+			"row aspect ratio"
+		)
+	end
+	-- Rarest first, then best condition.
+	for index = 2, #sorted do
+		local a, b = sorted[index - 1], sorted[index]
+		local orderA = RarityConfig.Rarities[a.Rarity].Order
+		local orderB = RarityConfig.Rarities[b.Rarity].Order
+		expect(orderA > orderB or (orderA == orderB and a.Condition >= b.Condition), "badly sorted")
+	end
+
+	local top, card = sorted[1], rows[1].Card
+	expect(
+		string.find(card.FossilName.Text, FossilConfig.ById[top.FossilId].DisplayName, 1, true),
+		"row name"
+	)
+	expect(string.find(card.FossilName.Text, "NEW", 1, true), "a new find is not tagged NEW")
+	expectEqual(card.Rarity.TextColor3, RarityConfig.Rarities[top.Rarity].Color, "rarity colour")
+	expectEqual(
+		card.Stripe.BackgroundColor3,
+		RarityConfig.Rarities[top.Rarity].Color,
+		"rarity stripe"
+	)
+	local grade = ExtractionMath.grade(top.Condition)
+	expectEqual(card.Condition.Text, `{grade.Name} {top.Condition}%`, "condition text")
+
+	local progress = InventoryService.GetSetProgress(player, "Triceratops")
+	expect(progress.Owned >= 1, "the test added a horn, so at least one piece is owned")
+	expectEqual(
+		panel.Sets.Triceratops.Progress.Text,
+		`Triceratops {progress.Owned}/3`,
+		"set progress"
+	)
+
+	-- Close with X; reopening shows no NEW tags.
+	Harness.press(panel.Close)
+	Harness.advance(0.3)
+	expect(not panel.Visible, "the panel did not close")
+	Harness.press(button)
+	Harness.frame()
+	for _, child in panel.List:GetChildren() do
+		if child:IsA("Frame") then
+			expect(
+				not string.find(child.Card.FossilName.Text, "NEW", 1, true),
+				"NEW was not cleared"
+			)
+		end
+	end
+
+	-- Uncovering a fossil closes the panel, so the extraction can be seen.
+	uncoverNextFossil()
+	Harness.roundTrip()
+	Harness.advance(0.3)
+	expect(not panel.Visible, "the panel stayed open during an extraction")
+	playExtraction({ "Perfect", "Perfect", "Good" }, { "space", "space", "space" })
+	closeExtraction()
+end)
+
+------------------------------------------------------------------------------
+print("\nAnalytics")
+
+test("the onboarding funnel logs each step once, in order", function()
+	local AnalyticsService = serverRequire(Server.Services.AnalyticsService)
+	local steps = table.concat(AnalyticsService.GetLoggedSteps(player), ",")
+	expectEqual(steps, "Joined,FirstSwing,FirstFossilUncovered,FirstExtraction", "logged steps")
+	AnalyticsService.LogOnboardingStep(player, "FirstSwing")
+	expectEqual(#AnalyticsService.GetLoggedSteps(player), 4, "a step was logged twice")
+	local newcomer = Harness.addPlayer("Newcomer", 1004)
+	expectEqual(table.concat(AnalyticsService.GetLoggedSteps(newcomer), ","), "Joined", "newcomer")
+	Harness.removePlayer(newcomer)
+end)
+
+------------------------------------------------------------------------------
 print("\nLifecycle")
 
 test("a second player gets a separate plot", function()
@@ -733,6 +1339,15 @@ test("a leaving player's plot is cleared and covered again", function()
 	expectEqual(#model.Fossils:GetChildren(), 0, "fossils left behind")
 	expect(model.Ground:FindFirstChild("Cover") ~= nil, "the cover was not put back")
 	expectEqual(model:GetAttribute("OwnerUserId"), 0, "OwnerUserId")
+end)
+
+test("the inventory resets on rejoin (no saving until Milestone 4)", function()
+	local DataService = serverRequire(Server.Services.DataService)
+	local InventoryService = serverRequire(Server.Services.InventoryService)
+	expect(DataService.Get(player) == nil, "the leaving player's data was kept")
+	local again = Harness.addPlayer("Tester", 1001)
+	expectEqual(#InventoryService.GetEntries(again), 0, "a rejoining player's inventory")
+	Harness.removePlayer(again)
 end)
 
 test("no hidden errors were raised anywhere", function()

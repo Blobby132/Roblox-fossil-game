@@ -97,6 +97,33 @@ local SOUNDS: { [string]: { SoundLayer } } = {
 		{ Id = TICK, Volume = 0.7, Pitch = 2.52, Delay = 0.3 },
 	},
 
+	-- Extraction minigame. Perfect is crisp and bright, Good softer, Miss a
+	-- dull thunk. Extracted is the "into your collection" moment at the end.
+	ExtractOpen = {
+		{ Id = WHUP, Volume = 0.35, Pitch = 1.3 },
+	},
+	ExtractPerfect = {
+		{ Id = TICK, Volume = 0.8, Pitch = 2.4 },
+		{ Id = TICK, Volume = 0.6, Pitch = 3.2, Delay = 0.04 },
+	},
+	ExtractGood = {
+		{ Id = TICK, Volume = 0.45, Pitch = 1.5 },
+	},
+	ExtractMiss = {
+		{ Id = THUD, Volume = 0.75, Pitch = 0.5, Length = 0.35 },
+		{ Id = TICK, Volume = 0.25, Pitch = 0.35 },
+	},
+	Extracted = {
+		{ Id = THUD, Volume = 0.5, Pitch = 0.8 },
+		{ Id = TICK, Volume = 0.65, Pitch = 1.26 },
+		{ Id = TICK, Volume = 0.65, Pitch = 1.5, Delay = 0.08 },
+		{ Id = TICK, Volume = 0.65, Pitch = 1.89, Delay = 0.16 },
+		{ Id = TICK, Volume = 0.7, Pitch = 2.52, Delay = 0.26 },
+	},
+	InventoryOpen = {
+		{ Id = RUSTLE, Volume = 0.3, Pitch = 1.4, Length = 0.25 },
+	},
+
 	-- The plot refills with fresh ground.
 	Refill = {
 		{ Id = BOOM, Volume = 0.2, Pitch = 0.6, Length = 0.9 },

@@ -48,6 +48,8 @@ export type Plot = {
 	Dressed: { [number]: boolean }, -- cells that already show their hint
 	Generation: number, -- goes up by one every time the plot is reseeded
 	RefillToken: number, -- cancels a scheduled refill when it changes
+	RefillHeld: boolean, -- true while an extraction is running (see SetRefillHeld)
+	RefillPending: boolean, -- a refill came due while held; it runs once released
 }
 
 local PlotService = {}
@@ -156,6 +158,7 @@ end
 
 local function clearGrid(plot: Plot)
 	plot.RefillToken += 1
+	plot.RefillPending = false
 	plot.State = nil
 	plot.CellsFolder:ClearAllChildren()
 	plot.FossilsFolder:ClearAllChildren()
@@ -271,6 +274,7 @@ local function release(player: Player)
 	end
 	plotByPlayer[player] = nil
 	plot.Owner = nil
+	plot.RefillHeld = false
 	clearGrid(plot)
 	plot.Cover.Parent = plot.Model:FindFirstChild("Ground")
 	local model = plot.Model
@@ -320,17 +324,35 @@ function PlotService.Regenerate(plot: Plot)
 	generate(plot)
 end
 
--- Refills and reseeds the plot after GridConfig.RefillDelay seconds.
-function PlotService.ScheduleRefill(plot: Plot)
+-- Refills and reseeds the plot after `delay` seconds (GridConfig.RefillDelay
+-- by default). If the refill is held when it comes due, it waits for the release.
+function PlotService.ScheduleRefill(plot: Plot, delay: number?)
 	plot.RefillToken += 1
 	local token = plot.RefillToken
-	local delay = GridConfig.RefillDelay
-	plot.Model:SetAttribute("RefillAt", Workspace:GetServerTimeNow() + delay)
-	task.delay(delay, function()
-		if plot.RefillToken == token and plot.Owner ~= nil then
+	local seconds = delay or GridConfig.RefillDelay
+	plot.Model:SetAttribute("RefillAt", Workspace:GetServerTimeNow() + seconds)
+	task.delay(seconds, function()
+		if plot.RefillToken ~= token or plot.Owner == nil then
+			return
+		end
+		if plot.RefillHeld then
+			plot.RefillPending = true
+			plot.Model:SetAttribute("RefillAt", 0)
+		else
 			generate(plot)
 		end
 	end)
+end
+
+-- While held, a refill that comes due waits instead of running, so the ground
+-- never refills under a fossil the player is still extracting. On release, a
+-- waiting refill runs GridConfig.RefillDelayAfterExtraction seconds later.
+function PlotService.SetRefillHeld(plot: Plot, held: boolean)
+	plot.RefillHeld = held
+	if not held and plot.RefillPending then
+		plot.RefillPending = false
+		PlotService.ScheduleRefill(plot, GridConfig.RefillDelayAfterExtraction)
+	end
 end
 
 function PlotService.Init()
@@ -350,6 +372,8 @@ function PlotService.Init()
 			Dressed = {},
 			Generation = 0,
 			RefillToken = 0,
+			RefillHeld = false,
+			RefillPending = false,
 		})
 	end
 end

@@ -16,6 +16,11 @@
 
 	Everything here is cosmetic and local. If the server does not confirm, the
 	moment is quietly cancelled.
+
+	The uncovered fossil then hovers while the player extracts it
+	(ExtractionController). Each extraction hit makes it react (a swell and
+	sparkles for a good hit, chips flying off for a miss), and once it is
+	extracted it shrinks and flies away into the collection.
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -23,6 +28,7 @@ local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 
 local Shared = ReplicatedStorage.Shared
+local ExtractionConfig = require(Shared.Config.ExtractionConfig)
 local FeelConfig = require(Shared.Config.FeelConfig)
 local FossilConfig = require(Shared.Config.FossilConfig)
 local RarityConfig = require(Shared.Config.RarityConfig)
@@ -57,13 +63,19 @@ type Display = {
 	Light: PointLight,
 	Highlight: Highlight,
 	Intensity: number,
+	Color: Color3, -- the rarity colour
+	BumpStart: number, -- extraction hit reaction; 0 = none
+	BumpAmount: number,
+	CollectStart: number, -- extracted and flying away; 0 = not yet
 }
 
 local RECENT_BREAK_WINDOW = 3 -- seconds
+local COLLECT_SPIN = 720 -- degrees per second while flying away
 
 local FossilController = {}
 
 local reveal = FeelConfig.Reveal
+local extractFeel = ExtractionConfig.Feel
 local pending: PendingReveal? = nil
 local lockedUntil = 0
 local displays: { [BasePart]: Display } = {}
@@ -201,6 +213,10 @@ local function display(index: number, part: BasePart, defId: string, animate: bo
 		Light = light,
 		Highlight = highlight,
 		Intensity = feel.Intensity,
+		Color = rarity.Color,
+		BumpStart = 0,
+		BumpAmount = 0,
+		CollectStart = 0,
 	}
 	displays[part] = entry
 
@@ -224,6 +240,21 @@ local function display(index: number, part: BasePart, defId: string, animate: bo
 		highlight.DepthMode = Enum.HighlightDepthMode.Occluded
 		part.Size = def.Size
 		part.CFrame = CFrame.new(hover) * entry.Rotation
+	end
+end
+
+-- Hides an extracted fossil on this client. The server removes the part
+-- itself shortly after.
+local function hidePart(part: BasePart)
+	part.Transparency = 1
+	for _, child in part:GetChildren() do
+		local isEffect = child:IsA("PointLight")
+			or child:IsA("Highlight")
+			or child:IsA("ParticleEmitter")
+			or child:IsA("BillboardGui")
+		if isEffect then
+			(child :: any).Enabled = false
+		end
 	end
 end
 
@@ -276,6 +307,30 @@ local function step(delta: number)
 		else
 			entry.Angle += math.rad(reveal.IdleSpinSpeed) * delta
 		end
+
+		-- An extraction hit: swell for an instant, then settle.
+		if entry.BumpStart > 0 then
+			local alpha = math.clamp((now - entry.BumpStart) / extractFeel.BumpTime, 0, 1)
+			scale *= 1 + entry.BumpAmount * (1 - alpha) * (1 - alpha)
+			if alpha >= 1 then
+				entry.BumpStart = 0
+			end
+		end
+
+		-- Extracted: spin up, rise, shrink away.
+		if entry.CollectStart > 0 then
+			local alpha = math.clamp((now - entry.CollectStart) / extractFeel.CollectTime, 0, 1)
+			local eased = alpha * alpha
+			position += Vector3.new(0, extractFeel.CollectRise * eased, 0)
+			scale *= math.max(1 - eased, 0.01)
+			entry.Angle += math.rad(COLLECT_SPIN) * delta
+			if alpha >= 1 then
+				displays[part] = nil
+				hidePart(part)
+				continue
+			end
+		end
+
 		part.Size = entry.Size * scale
 		part.CFrame = CFrame.new(position) * CFrame.Angles(0, entry.Angle, 0) * entry.Rotation
 	end
@@ -283,6 +338,10 @@ end
 
 local function onFossilAdded(index: number, part: BasePart)
 	local defId = part:GetAttribute("DefId")
+	if part:GetAttribute("Stage") == "Extracted" then
+		hidePart(part)
+		return
+	end
 	if part:GetAttribute("Stage") == "Revealed" and typeof(defId) == "string" then
 		display(index, part, defId, false)
 		return
@@ -373,6 +432,39 @@ function FossilController.confirmReveal(index: number, defId: string)
 	if feel and feel.ExtraSlow > 0 then
 		TimeScale.extend(feel.ExtraSlow)
 	end
+end
+
+-- An extraction hit landed on the fossil in this cell: make it react.
+function FossilController.extractionHit(index: number, rating: string)
+	local part = PlotController.getFossilPart(index)
+	local entry = part and displays[part]
+	local feel = extractFeel.Ratings[rating]
+	if part == nil or entry == nil or feel == nil then
+		return
+	end
+	if feel.Bump > 0 then
+		entry.BumpStart = os.clock()
+		entry.BumpAmount = feel.Bump
+	end
+	if feel.Sparkles > 0 then
+		ParticlePool.emit(reveal.SparkleParticles, part.Position, nil, feel.Sparkles, entry.Color)
+	end
+	if feel.Chips > 0 then
+		local chipSize = Vector3.new(1, 1, 1) * math.min(entry.Size.X, entry.Size.Y, entry.Size.Z)
+		DebrisField.burst(part.Position, chipSize, part.Color, part.Material, feel.Chips)
+	end
+end
+
+-- The fossil in this cell has been extracted: send it flying into the collection.
+function FossilController.collect(index: number)
+	local part = PlotController.getFossilPart(index)
+	local entry = part and displays[part]
+	if part == nil or entry == nil or entry.CollectStart > 0 then
+		return
+	end
+	entry.CollectStart = os.clock()
+	entry.BumpStart = 0
+	ParticlePool.emit(reveal.SparkleParticles, part.Position, nil, entry.Intensity, entry.Color)
 end
 
 -- The server did not agree that the fossil is uncovered yet.

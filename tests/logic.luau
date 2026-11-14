@@ -1,6 +1,6 @@
 --[[
-	Rule tests: the grid maths, plot seeding and dig rules, with no players
-	or network involved.
+	Rule tests: the grid maths, plot seeding, dig rules, extraction maths and
+	rules, and inventory logic, with no players or network involved.
 
 	Run from the project folder:   lune run tests/logic
 ]]
@@ -24,6 +24,11 @@ local GridMath = requireModule(Shared.Dig.GridMath)
 local DigRules = requireModule(Shared.Dig.DigRules)
 local PlotGenerator = requireModule(Server.Dig.PlotGenerator)
 local PlotRules = requireModule(Server.Dig.PlotRules)
+local ExtractionConfig = requireModule(Shared.Config.ExtractionConfig)
+local ExtractionMath = requireModule(Shared.Extraction.ExtractionMath)
+local ExtractionRules = requireModule(Server.Extraction.ExtractionRules)
+local InventoryLogic = requireModule(Shared.Inventory.InventoryLogic)
+local RarityConfig = requireModule(Shared.Config.RarityConfig)
 
 local dims = DigRules.Dims
 local Vector3 = require("@lune/roblox").Vector3
@@ -346,6 +351,341 @@ test("50 plots can each be dug to completion", function()
 			expectEqual(fossil.Stage, "Revealed", "fossil stage")
 		end
 		expect(PlotRules.isComplete(state), `seed {seed} is not complete after every fossil`)
+	end
+end)
+
+print("\nExtraction maths")
+
+local function near(a: number, b: number, tolerance: number?): boolean
+	return math.abs(a - b) <= (tolerance or 1e-6)
+end
+
+test("the marker starts where the segment says and moves the right way", function()
+	local right = { Hit = 1, StartAt = 10, StartPos = 0.3, StartDir = 1, Speed = 0.5 }
+	local position, direction = ExtractionMath.positionAt(right, 10)
+	expect(near(position, 0.3), "start position")
+	expectEqual(direction, 1, "start direction")
+	expect(near(ExtractionMath.positionAt(right, 11), 0.8), "after one second moving right")
+	-- Before the segment starts, the marker waits at its start.
+	expect(near(ExtractionMath.positionAt(right, 5), 0.3), "position before the start")
+
+	local left = { Hit = 1, StartAt = 10, StartPos = 0.3, StartDir = -1, Speed = 0.5 }
+	position, direction = ExtractionMath.positionAt(left, 10.2)
+	expect(near(position, 0.2), "after 0.2 s moving left")
+	expectEqual(direction, -1, "still moving left")
+end)
+
+test("the marker bounces off both ends and never leaves the bar", function()
+	local segment = { Hit = 1, StartAt = 0, StartPos = 0.9, StartDir = 1, Speed = 1 }
+	local position, direction = ExtractionMath.positionAt(segment, 0.3)
+	expect(near(position, 0.8), "bounced off the right end")
+	expectEqual(direction, -1, "moving left after the bounce")
+	position, direction = ExtractionMath.positionAt(segment, 1.3)
+	expect(near(position, 0.2), "bounced off the left end")
+	expectEqual(direction, 1, "moving right after the second bounce")
+	for step = 0, 2000 do
+		local t = step * 0.0137
+		local p = ExtractionMath.positionAt(segment, t)
+		expect(p >= 0 and p <= 1, `the marker left the bar at t={t}: {p}`)
+	end
+end)
+
+test("a stop is rated by its distance from the zone centre", function()
+	local perfectWidth, goodWidth = 0.1, 0.3
+	local condition = ExtractionConfig.Condition
+	local rating, points = ExtractionMath.rate(0.5, 0.5, perfectWidth, goodWidth)
+	expectEqual(rating, "Perfect", "dead centre")
+	expect(near(points, condition.Perfect.Max), "dead centre is worth the most")
+	expectEqual(ExtractionMath.rate(0.549, 0.5, perfectWidth, goodWidth), "Perfect", "inner edge")
+	expectEqual(
+		ExtractionMath.rate(0.551, 0.5, perfectWidth, goodWidth),
+		"Good",
+		"just outside Perfect"
+	)
+	expectEqual(ExtractionMath.rate(0.351, 0.5, perfectWidth, goodWidth), "Good", "Good edge")
+	expectEqual(
+		ExtractionMath.rate(0.649, 0.5, perfectWidth, goodWidth),
+		"Good",
+		"Good edge, right"
+	)
+	expectEqual(ExtractionMath.rate(0.66, 0.5, perfectWidth, goodWidth), "Miss", "outside the zone")
+	local _, far = ExtractionMath.rate(0, 0.9, perfectWidth, goodWidth)
+	expect(near(far, condition.Miss.Min), "a far miss is worth the least")
+
+	-- Points never go up as the stop moves away from the centre.
+	local previous = math.huge
+	for step = 0, 100 do
+		local _, value = ExtractionMath.rate(0.5 + step * 0.005, 0.5, perfectWidth, goodWidth)
+		expect(value <= previous + 1e-9, "points rose with distance")
+		previous = value
+	end
+end)
+
+test("condition is 1-100: three Perfects make 100, three misses still give a fossil", function()
+	local condition = ExtractionConfig.Condition
+	local best = { condition.Perfect.Max, condition.Perfect.Max, condition.Perfect.Max }
+	expectEqual(ExtractionMath.condition(best), 100, "three dead-centre Perfects")
+	local worst = { condition.Miss.Min, condition.Miss.Min, condition.Miss.Min }
+	local worstCondition = ExtractionMath.condition(worst)
+	expect(worstCondition >= 1, "three misses must still give a condition of at least 1")
+	expect(worstCondition < 40, `three misses gave {worstCondition}, which is too generous`)
+	expectEqual(ExtractionMath.condition({ 0, 0, 0 }), math.max(1, condition.Base), "no points")
+	expectEqual(ExtractionMath.condition({ 500 }), 100, "capped at 100")
+	expectEqual(ExtractionMath.condition({ -500 }), 1, "never below 1")
+	local mixed = ExtractionMath.condition({ 32, 31, 22 })
+	expect(mixed >= 80 and mixed < 95, `Perfect, Perfect, Good should be Excellent, got {mixed}`)
+end)
+
+test("grades read as intended", function()
+	expectEqual(ExtractionMath.describe("Ammonite", 87), "Ammonite: Excellent, 87%", "describe")
+	expectEqual(ExtractionMath.grade(100).Name, "Pristine", "100")
+	expectEqual(ExtractionMath.grade(1).Name, "Damaged", "1")
+	-- Grades are listed best first, and every condition gets one.
+	local grades = ExtractionConfig.Grades
+	for index = 2, #grades do
+		expect(grades[index].Min < grades[index - 1].Min, "grades must be listed best first")
+	end
+	for value = 1, 100 do
+		expect(value >= ExtractionMath.grade(value).Min, `condition {value} got a grade above it`)
+	end
+end)
+
+test("rarer fossils have a faster marker and smaller zones", function()
+	local rarities = {}
+	for id, def in RarityConfig.Rarities do
+		table.insert(rarities, { Id = id, Order = def.Order })
+	end
+	table.sort(rarities, function(a, b)
+		return a.Order < b.Order
+	end)
+	local lastSpeed, lastGood, lastPerfect = 0, math.huge, math.huge
+	for _, rarity in rarities do
+		expect(ExtractionConfig.ByRarity[rarity.Id] ~= nil, rarity.Id .. " has no modifiers")
+		local speeds = ExtractionMath.speedsFor(rarity.Id)
+		local perfect, good = ExtractionMath.zoneWidthsFor(rarity.Id)
+		expectEqual(#speeds, ExtractionConfig.Hits, "a speed for every hit")
+		expect(speeds[1] >= lastSpeed, rarity.Id .. " is slower than a commoner rarity")
+		expect(good <= lastGood and perfect <= lastPerfect, rarity.Id .. " has a bigger zone")
+		expect(perfect < good, "the Perfect band must sit inside the Good band")
+		lastSpeed, lastGood, lastPerfect = speeds[1], good, perfect
+	end
+	expectEqual(ExtractionConfig.Hits, 3, "hits per extraction")
+end)
+
+test("zones stay on the bar and move away from the last one", function()
+	local random = seeded(99)
+	local zone = ExtractionConfig.Zone
+	for _ = 1, 2000 do
+		local reference = random()
+		local _, good = ExtractionMath.zoneWidthsFor("Common")
+		local center = ExtractionMath.pickZone(random, reference, good)
+		expect(center - good / 2 >= zone.EdgeMargin - 1e-9, "the zone hangs off the left end")
+		expect(center + good / 2 <= 1 - zone.EdgeMargin + 1e-9, "the zone hangs off the right end")
+		expect(
+			math.abs(center - reference) >= zone.MinShift - 1e-9,
+			`zone {center} is too close to {reference}`
+		)
+	end
+end)
+
+print("\nExtraction rules")
+
+-- A fresh extraction, plus the server time its marker sets off.
+local function newExtraction(rarity: string, seed: number)
+	local state = ExtractionRules.new(rarity, 1000, seeded(seed))
+	return state, state.Setup.StartAt
+end
+
+-- The first moment from `from` on when the marker is at `target`.
+local function timeAt(segment: any, target: number, from: number): number
+	local t = math.max(from, segment.StartAt)
+	local step = 1 / 2000
+	local previous = ExtractionMath.positionAt(segment, t) - target
+	for _ = 1, 20000 do
+		local nextT = t + step
+		local value = ExtractionMath.positionAt(segment, nextT) - target
+		if previous == 0 or (previous < 0) ~= (value < 0) then
+			return nextT
+		end
+		t, previous = nextT, value
+	end
+	error("the marker never reached " .. target)
+end
+
+test("a new extraction is set up entirely by the server", function()
+	for seed = 1, 50 do
+		local state = ExtractionRules.new("Rare", 500, seeded(seed))
+		local setup = state.Setup
+		expectEqual(setup.Hits, ExtractionConfig.Hits, "hits")
+		expect(near(setup.StartAt, 500 + ExtractionConfig.StartDelay), "start time")
+		expect(setup.Deadline > setup.StartAt, "the deadline is after the start")
+		expectEqual(#setup.Zones, setup.Hits, "a zone for every hit")
+		expect(setup.StartDir == 1 or setup.StartDir == -1, "start direction")
+		expectEqual(state.Segment.Hit, 1, "first segment")
+		expect(not state.Finished, "a new extraction is not finished")
+	end
+end)
+
+test("the server rates each tap where the marker really was", function()
+	local state = newExtraction("Common", 3)
+	local wanted = { "Perfect", "Good", "Miss" }
+	local setup = state.Setup
+	for hit, rating in wanted do
+		local segment = state.Segment
+		local center = setup.Zones[hit]
+		local target = center
+		if rating == "Good" then
+			local offset = (setup.PerfectWidth + setup.GoodWidth) / 4
+			target = if center + offset < 0.97 then center + offset else center - offset
+		elseif rating == "Miss" then
+			target = if center > 0.5 then 0.03 else 0.97
+		end
+		local at = timeAt(segment, target, segment.StartAt)
+		local outcome = ExtractionRules.tap(state, at, at + 0.05)
+		expect(outcome.Ok, `tap {hit} refused: {outcome.Code}`)
+		expectEqual(outcome.Rating, rating, `tap {hit}`)
+		expectEqual(outcome.Hit, hit, "hit number")
+		expect(near(outcome.RatedAt, at), "rated at the claimed moment")
+		if hit < #wanted then
+			expect(
+				near(state.Segment.StartAt, at + setup.HitPause),
+				"the next segment waits a pause"
+			)
+			expect(
+				near(state.Segment.StartPos, outcome.Position),
+				"the next segment starts at the stop"
+			)
+		end
+	end
+	expect(state.Finished, "finished after three taps")
+	local condition = ExtractionRules.condition(state)
+	expectEqual(condition, ExtractionMath.condition(state.Points), "condition")
+	expect(condition >= 1 and condition <= 100, "condition in range")
+end)
+
+test("taps before the marker moves, too fast, during the pause or extra are refused", function()
+	local state, startAt = newExtraction("Common", 5)
+	local early = ExtractionRules.tap(state, startAt - 1, startAt - 1)
+	expect(not early.Ok and early.Code == "NotStarted", "a tap before the start")
+	expectEqual(#state.Ratings, 0, "no hit recorded for an early tap")
+
+	local first = ExtractionRules.tap(state, startAt + 0.3, startAt + 0.3)
+	expect(first.Ok, "a normal tap")
+	local burst = ExtractionRules.tap(state, startAt + 0.31, startAt + 0.31)
+	expect(not burst.Ok and burst.Code == "TooFast", "a second tap 10 ms later")
+	local paused = ExtractionRules.tap(state, startAt + 0.5, startAt + 0.5)
+	expect(not paused.Ok and paused.Code == "TooFast", "a tap during the pause after a hit")
+	expectEqual(#state.Ratings, 1, "refused taps add no hits")
+
+	local resume = state.Segment.StartAt
+	expect(ExtractionRules.tap(state, resume + 0.2, resume + 0.2).Ok, "second tap")
+	resume = state.Segment.StartAt
+	expect(ExtractionRules.tap(state, resume + 0.2, resume + 0.2).Ok, "third tap")
+	expect(state.Finished, "finished")
+	local extra = ExtractionRules.tap(state, resume + 2, resume + 2)
+	expect(not extra.Ok and extra.Code == "Finished", "a fourth tap")
+	expectEqual(#state.Ratings, 3, "still three hits")
+end)
+
+test("old and future timestamps are moved into the lag window", function()
+	local limits = ExtractionConfig.Server
+	local state, startAt = newExtraction("Common", 8)
+	-- Claim a moment long gone (say, a known Perfect): rated at the window's edge.
+	local arrival = startAt + 2
+	local old = ExtractionRules.tap(state, startAt + 0.1, arrival)
+	expect(old.Ok, "an old timestamp is still a tap")
+	expect(near(old.RatedAt, arrival - limits.LagAllowance), "rated at the oldest allowed moment")
+
+	local resume = state.Segment.StartAt
+	local future = ExtractionRules.tap(state, resume + 30, resume + 1)
+	expect(future.Ok, "a future timestamp is still a tap")
+	expect(
+		near(future.RatedAt, resume + 1 + limits.ClockTolerance),
+		"rated at the newest allowed moment"
+	)
+end)
+
+test("running out of time still gives the fossil, with misses for the missing taps", function()
+	local state, startAt = newExtraction("Uncommon", 13)
+	expect(ExtractionRules.tap(state, startAt + 0.4, startAt + 0.4).Ok, "one real tap")
+	ExtractionRules.expire(state)
+	expect(state.Finished and state.TimedOut, "finished by timeout")
+	expectEqual(#state.Ratings, 3, "every hit has a rating")
+	expectEqual(state.Ratings[2], "Miss", "missing tap 2")
+	expectEqual(state.Ratings[3], "Miss", "missing tap 3")
+	expect(ExtractionRules.condition(state) >= 1, "condition at least 1")
+
+	local idle = newExtraction("Rare", 21)
+	ExtractionRules.expire(idle)
+	local condition = ExtractionRules.condition(idle)
+	expect(condition >= 1, "an untouched extraction still gives a condition of at least 1")
+	expectEqual(condition, ExtractionMath.condition({ 3, 3, 3 }), "three worst misses")
+end)
+
+print("\nInventory")
+
+local function entry(id: number, fossilId: string, condition: number, foundAt: number)
+	return {
+		Id = id,
+		FossilId = fossilId,
+		Rarity = FossilConfig.ById[fossilId].Rarity,
+		Condition = condition,
+		FoundAt = foundAt,
+	}
+end
+
+test("finds sort rarest first, then by condition, then newest", function()
+	local list = {
+		entry(1, "Ammonite", 90, 100),
+		entry(2, "TriceratopsHorn", 40, 101),
+		entry(3, "SmallDinoBone", 70, 102),
+		entry(4, "Ammonite", 95, 103),
+		entry(5, "TriceratopsClaw", 80, 104),
+		entry(6, "Ammonite", 90, 105),
+	}
+	local sorted = InventoryLogic.sorted(list)
+	local order = {}
+	for index, item in sorted do
+		order[index] = item.Id
+	end
+	expectEqual(table.concat(order, ","), "5,2,3,4,6,1", "sorted order")
+	expectEqual(list[1].Id, 1, "sorted() must not reorder the original list")
+end)
+
+test("duplicates stay separate, and set progress counts distinct pieces", function()
+	local list = {
+		entry(1, "TriceratopsHorn", 50, 100),
+		entry(2, "TriceratopsHorn", 90, 101),
+		entry(3, "Ammonite", 60, 102),
+	}
+	expectEqual(#InventoryLogic.sorted(list), 3, "duplicates are kept as separate entries")
+	local progress = InventoryLogic.setProgress(list, "Triceratops")
+	expectEqual(progress.Owned, 1, "two horns are one piece")
+	expectEqual(progress.Total, 3, "pieces in the set")
+	table.insert(list, entry(4, "TriceratopsSkull", 20, 103))
+	table.insert(list, entry(5, "TriceratopsClaw", 30, 104))
+	expectEqual(InventoryLogic.setProgress(list, "Triceratops").Owned, 3, "a complete set")
+	expect(InventoryLogic.setProgress(list, "NoSuchSet") == nil, "unknown set")
+	expectEqual(#InventoryLogic.allSetProgress({}), 1, "one set defined")
+end)
+
+test("entries from the network are checked", function()
+	local good = entry(7, "Ammonite", 55, 1700000000)
+	expect(InventoryLogic.validate(good) ~= nil, "a real entry")
+	local bad = {
+		"text",
+		42,
+		{},
+		{ Id = 1.5, FossilId = "Ammonite", Rarity = "Common", Condition = 50, FoundAt = 1 },
+		{ Id = 1, FossilId = "Dragon", Rarity = "Common", Condition = 50, FoundAt = 1 },
+		{ Id = 1, FossilId = "Ammonite", Rarity = "Mythic", Condition = 50, FoundAt = 1 },
+		{ Id = 1, FossilId = "Ammonite", Rarity = "Common", Condition = 0, FoundAt = 1 },
+		{ Id = 1, FossilId = "Ammonite", Rarity = "Common", Condition = 101, FoundAt = 1 },
+		{ Id = 1, FossilId = "Ammonite", Rarity = "Common", Condition = 0 / 0, FoundAt = 1 },
+		{ Id = 1, FossilId = "Ammonite", Rarity = "Common", Condition = 50, FoundAt = "now" },
+	}
+	for index, value in bad do
+		expect(InventoryLogic.validate(value) == nil, `bad entry {index} was accepted`)
 	end
 end)
 

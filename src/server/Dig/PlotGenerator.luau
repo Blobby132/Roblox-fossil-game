@@ -96,6 +96,7 @@ function PlotGenerator.generate(nextNumber: () -> number): PlotRules.PlotState
 			Stage = "Buried",
 			Clean = 0,
 			CleanNeeded = def.CleanStrokes,
+			ExtractionStarted = false,
 		}
 
 		-- 3. Hints: the fossil's own cell and the cells above it, fading with distance.

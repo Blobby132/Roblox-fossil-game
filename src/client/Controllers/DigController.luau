@@ -13,6 +13,9 @@
 	swing and answers with SwingResult. If it disagrees (rare: lag, or a
 	tampered client), the prediction is undone here.
 
+	Digging pauses during the reveal moment and while a fossil is being
+	extracted (the server refuses swings then too).
+
 	Controls: left click (hold to keep swinging) on PC, tap on mobile.
 ]]
 
@@ -33,6 +36,7 @@ local ToolConfig = require(Shared.Config.ToolConfig)
 local Client = script.Parent.Parent
 local CellVisuals = require(Client.Effects.CellVisuals)
 local EffectsController = require(script.Parent.EffectsController)
+local ExtractionController = require(script.Parent.ExtractionController)
 local FossilController = require(script.Parent.FossilController)
 local PlotController = require(script.Parent.PlotController)
 local ToolController = require(script.Parent.ToolController)
@@ -187,7 +191,7 @@ end
 -- One swing attempt along a ray from the camera.
 local function trySwing(origin: Vector3, direction: Vector3)
 	local now = os.clock()
-	if now < nextSwingAt or FossilController.isBusy() then
+	if now < nextSwingAt or FossilController.isBusy() or ExtractionController.isBusy() then
 		return
 	end
 
@@ -325,6 +329,10 @@ end
 
 local function updateHover()
 	if not FeelConfig.Hover.Enabled then
+		return
+	end
+	if ExtractionController.isBusy() then
+		EffectsController.setHover(nil, nil)
 		return
 	end
 	local camera = Workspace.CurrentCamera

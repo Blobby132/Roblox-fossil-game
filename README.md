@@ -2,7 +2,7 @@
 
 A Roblox simulator about digging up fossils. This folder is the game's source code. [Rojo](https://rojo.space) copies it into Roblox Studio.
 
-**Current state: Milestone 1 (digging feel).** You get your own dig plot, a pickaxe and a brush, and fossils to uncover. There is no extraction minigame, inventory, museum, money, upgrades or saving yet.
+**Current state: Milestone 2 (extraction + inventory).** You get your own dig plot, a pickaxe and a brush, and fossils to uncover. Each uncovered fossil starts a short timing minigame that decides its condition, then goes into your inventory. There is no museum, money, upgrades or saving yet: the inventory resets when you rejoin.
 
 ## Fastest way to try it (no installs)
 
@@ -76,7 +76,8 @@ Things to know:
   ```
 
 - A brand new **Baseplate** place also works (connect Rojo to it). The dig site is built above the baseplate.
-- Nothing in Milestone 1 needs Studio's "API Services" setting, publishing, or any uploaded assets. Saving (Milestone 4) will need **Enable Studio Access to API Services**, which requires publishing the place first.
+- Nothing so far needs Studio's "API Services" setting, publishing, or any uploaded assets. Saving (Milestone 4) will need **Enable Studio Access to API Services**, which requires publishing the place first.
+- Analytics events are printed to the Output window in Studio (lines starting `[Analytics]`) instead of being sent. See `AnalyticsConfig.luau`.
 
 ## Controls
 
@@ -84,7 +85,11 @@ Things to know:
 | --- | --- | --- |
 | Swing at a cell | Left click (hold to keep swinging) | Tap the cell |
 | Switch tool | `1` Pickaxe, `2` Brush, or `Q` to swap | Tap a tool button |
+| Stop the extraction marker | Left click anywhere, or `Space` | Tap anywhere |
+| Open or close your finds | Click the bone button (right edge) | Tap the bone button |
 | Move, jump, camera | Roblox defaults | Roblox defaults |
+
+During an extraction, `Space` stops the marker instead of jumping, and digging is paused.
 
 Developer shortcuts (work for anyone inside Studio, and for the UserIds in `DebugConfig` in a published game):
 
@@ -100,7 +105,19 @@ Developer shortcuts (work for anyone inside Studio, and for the UserIds in `Debu
 - You can dig any cell that open air touches: the surface, or a cell next to a hole.
 - Cells above a buried fossil are paler and cracked. The closer to the fossil, the stronger the hint.
 - Breaking a fossil's cell leaves a dirt crust. Brush the crust until the fossil is uncovered.
-- When every fossil in the plot is uncovered, the plot refills with new fossils after a few seconds.
+- When every fossil in the plot is uncovered, the plot refills with new fossils after a few seconds. It never refills while you are still extracting a fossil; it waits until you finish.
+
+## How extraction works
+
+- The final brush stroke uncovers the fossil, and the extraction bar appears a moment later.
+- A marker sweeps back and forth across the bar. Stop it three times. Each stop is rated **Perfect** (the gold band), **Good** (the green band) or **Miss**.
+- Each hit gets a new zone, and the marker speeds up a little each time. Rarer fossils have a faster marker and a smaller zone.
+- The three ratings set the fossil's condition, from 1 to 100%. A fossil is never destroyed: even three misses give you the fossil. Walking away also gives it to you once time runs out, with misses for the taps you skipped.
+- The end shows the fossil's name in its rarity colour and its condition, for example "Ammonite: Excellent, 87%", and the fossil goes into your inventory.
+- Condition grades: Pristine 95+, Excellent 80+, Fine 60+, Fair 40+, Worn 20+, Damaged below 20.
+- The bone button on the right opens your finds, rarest first and then by condition. It also shows Triceratops set progress, for example "Triceratops 1/3". Each find is kept separately, so duplicates in different condition are all listed.
+
+The server decides the result. It picks the marker's speeds, start, direction and zones, and when the marker starts. The client only sends the moment of each tap. The server works out where the marker was at that moment and rates it, allowing a little network lag. Taps for someone else's extraction, taps that come too fast, and extra taps are refused.
 
 ## Where to tune things
 
@@ -112,11 +129,13 @@ Everything tunable is in `src/shared/Config/`:
 | `SoundConfig.luau` | Every sound effect (placeholders built from Roblox's built-in sounds) |
 | `ToolConfig.luau` | Tool cooldown, reach, damage per material, greybox look |
 | `MaterialConfig.luau` | Dirt and rock: health and colour |
-| `GridConfig.luau` | Grid size, rock per layer, fossils per plot, hints, refill delay |
+| `ExtractionConfig.luau` | The extraction minigame: marker speed, zone sizes, condition per rating, rarity difficulty, grades, lag allowance, and its feel (sounds, flash, shake) |
+| `GridConfig.luau` | Grid size, rock per layer, fossils per plot, hints, refill delays |
 | `FossilConfig.luau` | The fossils: rarity, how often they appear, brush strokes, greybox shape |
 | `RarityConfig.luau` | Rarity names and colours |
 | `DigConfig.luau` | Hold-to-swing, and how strict the server is about reach and speed |
 | `WorldConfig.luau` | Plot layout, number of plots, jump height, lighting |
+| `AnalyticsConfig.luau` | Onboarding funnel steps, and whether Studio sends or prints them |
 | `DebugConfig.luau` | Developer shortcut keys and who may use them |
 
 ## Project layout
@@ -129,21 +148,29 @@ src/
   shared/              -> ReplicatedStorage.Shared   (both sides can read it)
     Config/            all tunable numbers
     Dig/               grid maths and dig rules used by server and client
+    Extraction/        the minigame's maths (marker position, rating, condition)
+    Inventory/         what an inventory entry is, sorting, set progress
     Remotes.luau       creates every RemoteEvent in code
   server/              -> ServerScriptService.Server (players never receive it)
     Main.server.luau   the only Script; starts the services
-    Services/          PlotService, FossilService, ToolService, DigService, DebugService
+    Services/          PlotService, FossilService, ToolService, DigService,
+                       ExtractionService, InventoryService, DataService,
+                       AnalyticsService, DebugService
     Dig/               plot seeding and swing rules (pure logic)
+    Extraction/        extraction setup and tap rules (pure logic)
     World/             builds the greybox site
   client/              -> StarterPlayerScripts.Client
     Main.client.luau   the only LocalScript; starts the controllers
-    Controllers/       PlotController, ToolController, DigController, FossilController, ...
+    Controllers/       PlotController, ToolController, DigController, FossilController,
+                       ExtractionController, InventoryController, ...
     Effects/           sound, particles, crumble, camera, cell reactions
-    Ui/                interface helpers
+    Ui/                interface helpers, the extraction bar, the inventory panel
 tests/                 automated tests that run outside Roblox (see below)
 ```
 
-The server is in charge. The client only tells it "I swung at cell N". The server checks the request, the player's reach, the tool in hand, the cooldown and the cell, then decides what happened. The client predicts the result so feedback is instant, and corrects itself if the server disagrees.
+The server is in charge. The client only tells it "I swung at cell N". The server checks the request, the player's reach, the tool in hand, the cooldown and the cell, then decides what happened. The client predicts the result so feedback is instant, and corrects itself if the server disagrees. Extraction works the same way: the client sends only the moment of each tap and predicts the rating, and the server rates it.
+
+Player data (for now, just the inventory) lives in `DataService`, the only module that knows how it is stored. Milestone 4 replaces its inside with ProfileStore; nothing that uses it has to change.
 
 ## Checks
 
@@ -166,8 +193,8 @@ lune run tests/sim
 ```
 
 - `stylua` formats the code. `selene` looks for mistakes (the first run downloads Roblox's API list).
-- `tests/logic` checks the grid maths, plot seeding and dig rules.
-- `tests/sim` runs the real server and client code against a stand-in for the Roblox engine and plays a whole session: digging by mouse and touch, the reveal, the refill, and the server refusing bad, far, fast and flooded requests.
+- `tests/logic` checks the grid maths, plot seeding, dig rules, the extraction maths (marker movement, ratings, condition, rarity difficulty), the server's tap rules, and inventory sorting and set progress.
+- `tests/sim` runs the real server and client code against a stand-in for the Roblox engine and plays a whole session: digging by mouse and touch, the reveal, extracting every fossil by click, touch and Space, the inventory panel, the refill waiting for an extraction, the onboarding funnel, and the server refusing bad, far, fast, flooded, extra and someone else's requests.
 
 The tests prove the code runs and the rules hold. They cannot judge how the game feels; that is what the Studio playtest is for.
 

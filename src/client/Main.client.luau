@@ -16,8 +16,10 @@ local Controllers = script.Parent.Controllers
 local DebugController = require(Controllers.DebugController)
 local DigController = require(Controllers.DigController)
 local EffectsController = require(Controllers.EffectsController)
+local ExtractionController = require(Controllers.ExtractionController)
 local FossilController = require(Controllers.FossilController)
 local HudController = require(Controllers.HudController)
+local InventoryController = require(Controllers.InventoryController)
 local PlotController = require(Controllers.PlotController)
 local ToolController = require(Controllers.ToolController)
 
@@ -25,6 +27,8 @@ local controllers: { any } = {
 	EffectsController,
 	ToolController,
 	FossilController,
+	InventoryController,
+	ExtractionController,
 	DigController,
 	HudController,
 	DebugController,

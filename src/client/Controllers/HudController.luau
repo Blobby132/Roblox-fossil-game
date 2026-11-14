@@ -1,13 +1,14 @@
 --!strict
 --[[
-	HudController: the placeholder heads-up display for Milestone 1.
+	HudController: the dig-site part of the heads-up display.
 
 	  * "Fossils 2 / 5": how many of this plot's fossils have been uncovered
 	  * a countdown once the plot is complete and about to refill
 
-	The proper interface (money, inventory, upgrades, pop-in tweens) arrives in
-	Milestone 5. This already follows the UI rules in Ui.luau so it scales on
-	phones.
+	The inventory button and panel belong to InventoryController, and the
+	extraction bar to ExtractionController. The full interface polish (money,
+	upgrades) arrives in Milestone 5. Everything follows the UI rules in
+	Ui.luau so it scales on phones.
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")

@@ -9,8 +9,9 @@
 
 	Which fossil it is (DefId) is only written onto the part at Revealed.
 
-	Milestone 2 picks up from here: a Revealed fossil is what the extraction
-	minigame will start from.
+	Revealing a fossil starts the extraction minigame (ExtractionService).
+	Once it is extracted the fossil goes into the inventory, the part's Stage
+	attribute becomes "Extracted", and the part is removed shortly after.
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -113,6 +114,31 @@ function FossilService.Reveal(plot: PlotService.Plot, fossilIndex: number): stri
 		PlotService.ScheduleRefill(plot)
 	end
 	return def.Id
+end
+
+-- The fossil has been extracted into the player's inventory. Its part stays
+-- for `removeDelay` seconds so the client can animate it away, then goes.
+-- Does nothing if the plot has been reseeded since (`generation` is stale).
+function FossilService.MarkExtracted(
+	plot: PlotService.Plot,
+	fossilIndex: number,
+	generation: number,
+	removeDelay: number
+)
+	if plot.Generation ~= generation then
+		return
+	end
+	local part = plot.FossilParts[fossilIndex]
+	if part == nil then
+		return
+	end
+	part:SetAttribute("Stage", "Extracted")
+	task.delay(removeDelay, function()
+		if plot.Generation == generation and plot.FossilParts[fossilIndex] == part then
+			plot.FossilParts[fossilIndex] = nil
+			part:Destroy()
+		end
+	end)
 end
 
 -- Cell indices of the fossils that are still not uncovered (debug only).

@@ -325,6 +325,7 @@ local function installFakes()
 	implementEvent("UserInputService", "TouchTapInWorld")
 	implementEvent("UserInputService", "WindowFocusReleased")
 	implementEvent("GuiButton", "Activated")
+	implementEvent("GuiObject", "InputBegan")
 
 	-- Instance.
 	roblox.implementMethod("Instance", "SimRemove", function(self)
@@ -387,8 +388,11 @@ local function installFakes()
 	roblox.implementMethod("RemoteEvent", "FireServer", function(self, ...)
 		table.insert(toServer, { remote = self, player = localPlayer, args = table.pack(...) })
 	end)
-	roblox.implementMethod("RemoteEvent", "FireClient", function(self, _player, ...)
-		table.insert(toClient, { remote = self, args = table.pack(...) })
+	roblox.implementMethod("RemoteEvent", "FireClient", function(self, target, ...)
+		-- Only the local player has a client in this simulation.
+		if target == localPlayer then
+			table.insert(toClient, { remote = self, args = table.pack(...) })
+		end
 	end)
 
 	-- RunService.
@@ -449,7 +453,32 @@ local function installFakes()
 	end)
 	roblox.implementMethod("ContentProvider", "PreloadAsync", function() end)
 	roblox.implementMethod("StarterGui", "SetCoreGuiEnabled", function() end)
+
+	-- ContextActionService: bound actions get first go at matching key presses.
+	local function bind(name, handler, inputs)
+		Harness.boundActions[name] = { handler = handler, inputs = inputs }
+	end
+	roblox.implementMethod(
+		"ContextActionService",
+		"BindAction",
+		function(_self, name, handler, _button, ...)
+			bind(name, handler, { ... })
+		end
+	)
+	roblox.implementMethod(
+		"ContextActionService",
+		"BindActionAtPriority",
+		function(_self, name, handler, _button, _priority, ...)
+			bind(name, handler, { ... })
+		end
+	)
+	roblox.implementMethod("ContextActionService", "UnbindAction", function(_self, name)
+		Harness.boundActions[name] = nil
+	end)
 end
+
+-- Actions bound through ContextActionService, by name.
+Harness.boundActions = {} :: { [string]: { handler: any, inputs: { any } } }
 
 ------------------------------------------------------------------------------
 -- Globals that game code expects but Lune does not provide
@@ -791,11 +820,45 @@ function Harness.input(eventName: string, ...: any)
 	runDeferred()
 end
 
+-- A key press. As in the engine, an action bound to the key through
+-- ContextActionService runs first; if it sinks the input, other scripts see
+-- the press as already processed.
 function Harness.keyPress(keyCode: any)
-	Harness.input("InputBegan", {
+	local input = {
 		UserInputType = roblox.Enum.UserInputType.Keyboard,
+		UserInputState = roblox.Enum.UserInputState.Begin,
 		KeyCode = keyCode,
-	}, false)
+	}
+	local sunk = false
+	syncPositions()
+	withSide("Client", function()
+		for name, action in table.clone(Harness.boundActions) do
+			if table.find(action.inputs, keyCode) then
+				local thread = coroutine.create(action.handler)
+				local ok, result = coroutine.resume(thread, name, input.UserInputState, input)
+				if not ok then
+					report(result, thread)
+				elseif result == roblox.Enum.ContextActionResult.Sink then
+					sunk = true
+				end
+			end
+		end
+	end)
+	runDeferred()
+	Harness.input("InputBegan", input, sunk)
+end
+
+-- A click or tap that lands on a GuiObject (fires its InputBegan).
+--   inputType  Enum.UserInputType.MouseButton1 (default) or Touch
+function Harness.guiInput(guiObject: any, inputType: any?)
+	syncPositions()
+	withSide("Client", function()
+		signalFor(guiObject, "InputBegan"):Fire({
+			UserInputType = inputType or roblox.Enum.UserInputType.MouseButton1,
+			UserInputState = roblox.Enum.UserInputState.Begin,
+		})
+	end)
+	runDeferred()
 end
 
 -- A left click on whatever Harness.raycastResult currently points at.
